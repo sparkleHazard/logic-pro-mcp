@@ -36,8 +36,8 @@ enum ProjectDataParser {
     private static let idEvSq = "EvSq"
     private static let idMSeq = "MSeq"
 
-    // Arrangement marker OIDs per RE findings: 4, 8, 12, 16, 20, 24, 28, 32, 36
-    private static let markerOIDs: Set<UInt32> = [4, 8, 12, 16, 20, 24, 28, 32, 36]
+    // Arrangement marker OIDs vary per project — we scan ALL TxSq chunks
+    // and identify markers by RTF content rather than hardcoded OIDs
 
     // Tempo event signature: 7F 00 00 01 ...
     private static let tempoSignature: [UInt8] = [0x7F, 0x00, 0x00, 0x01]
@@ -215,14 +215,15 @@ enum ProjectDataParser {
 
     // MARK: - TxSq Name Extraction
 
-    /// Extract RTF text from TxSq chunks for arrangement marker OIDs.
+    /// Extract RTF text from ALL TxSq chunks.
     /// Returns a map of OID -> cleaned name.
+    /// Marker OIDs vary per project, so we extract everything and let the
+    /// EvSq type-18 join determine which are actual arrangement markers.
     private static func extractTxSqNames(chunks: [ChunkInfo], data: Data) -> [UInt32: String] {
         var result: [UInt32: String] = [:]
         for chunk in chunks where chunk.id == idTxSq {
-            guard markerOIDs.contains(chunk.oid) else { continue }
             guard chunk.bodyLength > 0 else { continue }
-            let body = data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)]
+            let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
             if let name = extractRTFText(body) {
                 result[chunk.oid] = name
             }
@@ -231,96 +232,75 @@ enum ProjectDataParser {
     }
 
     /// Extract plain text from an RTF body.
-    /// RTF starts with `{\rtf1`. We strip all `\cmdN` tags and braces.
+    /// Logic TxSq RTF typically has content after `\fs24` tag.
+    /// Strategy: decode as ASCII (ignoring non-printable), find `\fs24 ` or similar,
+    /// then extract the text between that and the closing `}`.
     private static func extractRTFText(_ body: Data) -> String? {
-        guard let raw = String(data: body, encoding: .utf8)
-                ?? String(data: body, encoding: .isoLatin1)
-        else { return nil }
+        // Decode as ASCII, replacing non-printable with dots
+        let asciiStr = String(body.map { b -> Character in
+            let s = Unicode.Scalar(b)
+            return s.value >= 32 && s.value < 127 ? Character(s) : Character(".")
+        })
 
-        // Must be RTF
-        guard raw.contains("{\\rtf") else {
-            // Try treating it as a direct pascal-style or length-prefixed string
+        // Must contain RTF marker
+        guard asciiStr.contains("{\\rtf") || asciiStr.contains("\\fs") else {
             return extractDirectString(body)
         }
 
-        // Find content after \fs<N> tag (font size, precedes actual text)
-        // Strategy: strip everything inside { } control blocks, then trim
-        let text = raw
-
-        // Remove all RTF control words (\word or \word<N>) and special chars
-        // We use a simple state-machine approach:
-        var result = ""
-        var i = text.startIndex
-
-        while i < text.endIndex {
-            let ch = text[i]
-            if ch == "{" || ch == "}" {
-                i = text.index(after: i)
-                continue
+        // Find content after \fs<N> (font size tag) — the actual text follows
+        // Pattern: \fs24 <space or \cf2> TEXT}
+        if let fsRange = asciiStr.range(of: "\\fs", options: .literal) {
+            // Skip past the font size number
+            var idx = fsRange.upperBound
+            while idx < asciiStr.endIndex && (asciiStr[idx].isNumber) {
+                idx = asciiStr.index(after: idx)
             }
-            if ch == "\\" {
-                // Skip control word or symbol
-                let next = text.index(after: i)
-                if next < text.endIndex {
-                    let nc = text[next]
-                    if nc == "\\" || nc == "{" || nc == "}" || nc == ";" || nc == "\n" || nc == "\r" {
-                        // Escaped char
-                        if nc == "\\" || nc == "{" || nc == "}" {
-                            result.append(nc)
-                        }
-                        i = text.index(after: next)
-                        continue
-                    }
-                    if nc == "'" {
-                        // Hex escape \'XX
-                        let h1 = text.index(next, offsetBy: 1, limitedBy: text.endIndex) ?? text.endIndex
-                        let h2 = text.index(next, offsetBy: 2, limitedBy: text.endIndex) ?? text.endIndex
-                        let h3 = text.index(next, offsetBy: 3, limitedBy: text.endIndex) ?? text.endIndex
-                        if h1 < text.endIndex && h2 < text.endIndex {
-                            let hexStr = String(text[h1..<h2])
-                            if let code = UInt32(hexStr, radix: 16),
-                               let scalar = Unicode.Scalar(code) {
-                                result.append(Character(scalar))
-                            }
-                            i = h3 < text.endIndex ? h3 : text.endIndex
-                        } else {
-                            i = text.index(after: next)
-                        }
-                        continue
-                    }
-                    if nc.isLetter || nc == "-" {
-                        // Control word: skip until non-alphanumeric (and skip optional numeric param + optional space)
-                        var j = next
-                        while j < text.endIndex && (text[j].isLetter || text[j] == "-") {
-                            j = text.index(after: j)
-                        }
-                        // skip optional numeric parameter
-                        if j < text.endIndex && (text[j].isNumber || text[j] == "-") {
-                            while j < text.endIndex && (text[j].isNumber || text[j] == "-") {
-                                j = text.index(after: j)
-                            }
-                        }
-                        // skip single trailing space
-                        if j < text.endIndex && text[j] == " " {
-                            j = text.index(after: j)
-                        }
-                        i = j
-                        continue
-                    }
+            // Skip whitespace and \cf2 color tags
+            var textStart = idx
+            while textStart < asciiStr.endIndex {
+                if asciiStr[textStart] == " " {
+                    textStart = asciiStr.index(after: textStart)
+                    continue
                 }
-                i = text.index(after: i)
-                continue
+                if asciiStr[textStart] == "\\" {
+                    // Skip control word
+                    var j = asciiStr.index(after: textStart)
+                    while j < asciiStr.endIndex && (asciiStr[j].isLetter || asciiStr[j].isNumber) {
+                        j = asciiStr.index(after: j)
+                    }
+                    if j < asciiStr.endIndex && asciiStr[j] == " " {
+                        j = asciiStr.index(after: j)
+                    }
+                    textStart = j
+                    continue
+                }
+                break
             }
-            if ch == "\n" || ch == "\r" {
-                i = text.index(after: i)
-                continue
+
+            // Extract text until closing brace
+            var textEnd = textStart
+            while textEnd < asciiStr.endIndex && asciiStr[textEnd] != "}" {
+                textEnd = asciiStr.index(after: textEnd)
             }
-            result.append(ch)
-            i = text.index(after: i)
+
+            if textStart < textEnd {
+                var text = String(asciiStr[textStart..<textEnd])
+                // Clean up: remove stray dots, trim
+                text = text.replacingOccurrences(of: "..", with: " ")
+                text = text.replacingOccurrences(of: ".", with: "")
+                text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Remove leading/trailing non-alphanumeric
+                while text.first != nil && !text.first!.isLetter && !text.first!.isNumber {
+                    text.removeFirst()
+                }
+                while text.last != nil && !text.last!.isLetter && !text.last!.isNumber {
+                    text.removeLast()
+                }
+                return text.isEmpty ? nil : text
+            }
         }
 
-        let cleaned = result.trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? nil : cleaned
+        return nil
     }
 
     /// Fallback: try to read a length-prefixed ASCII string from raw body bytes.
@@ -355,7 +335,7 @@ enum ProjectDataParser {
         var result: [MarkerEvent] = []
 
         for chunk in chunks where chunk.id == idEvSq {
-            let body = data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)]
+            let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
             let events = parseType18Triplets(body: body)
             result.append(contentsOf: events)
         }
@@ -374,6 +354,8 @@ enum ProjectDataParser {
     /// Parse type-18 triplets from an EvSq body.
     private static func parseType18Triplets(body: Data) -> [MarkerEvent] {
         var events: [MarkerEvent] = []
+        // Rebase to 0-based
+        let body = Data(body)
         let count = body.count / 16
         guard count >= 3 else { return events }
 
@@ -404,7 +386,6 @@ enum ProjectDataParser {
                 && m1 == 0x88000000
                 && t0 == 0
                 && t1 == 0x88000000
-                && markerOIDs.contains(m0)
             {
                 events.append(MarkerEvent(oid: m0, startTick: h1, durationTicks: m3))
                 i += 3
@@ -427,7 +408,7 @@ enum ProjectDataParser {
 
         for chunk in chunks where chunk.id == idEvSq {
             guard chunk.bodyLength >= 20 else { continue }
-            let body = data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)]
+            let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
             let tempos = parseTempoEvents(body: body)
             entries.append(contentsOf: tempos)
         }
@@ -440,7 +421,8 @@ enum ProjectDataParser {
 
     private static func parseTempoEvents(body: Data) -> [TempoEntry] {
         var entries: [TempoEntry] = []
-        let bytes = body
+        // Rebase slice to 0-based indices so direct subscript access works
+        let bytes = Data(body)
         let total = bytes.count
         var offset = 0
 
@@ -487,7 +469,7 @@ enum ProjectDataParser {
 
         for chunk in chunks where chunk.id == idMSeq {
             guard chunk.bodyLength > 0x12 else { continue }
-            let body = data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)]
+            let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
 
             guard body.count > 0x12 else { continue }
             let nameLen = Int(readLE16(body, at: 0x10))
@@ -499,6 +481,11 @@ enum ProjectDataParser {
 
             let cleaned = name.trimmingCharacters(in: .controlCharacters.union(.whitespacesAndNewlines))
             guard !cleaned.isEmpty else { continue }
+            // Filter out generic/internal tracks
+            guard !cleaned.hasPrefix("*Automation"),
+                  cleaned != "Untitled",
+                  !cleaned.hasPrefix("Track Automation")
+            else { continue }
 
             if seen.insert(chunk.oid).inserted {
                 result.append(ParsedTrack(name: cleaned, oid: Int(chunk.oid)))
