@@ -401,46 +401,35 @@ actor AccessibilityChannel: Channel {
         // Wait for the dialog to appear
         Thread.sleep(forTimeInterval: 0.4)
 
-        // Use clipboard paste — CGEvent unicode typing doesn't work in Logic's search dialog
-        guard let source = CGEventSource(stateID: .hidSystemState) else { return false }
-
-        // Put track name on clipboard
+        // Put track name on clipboard, then use osascript for all keystrokes
+        // (CGEvent HID tap is unreliable for Logic's custom search dialog)
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(name, forType: .string)
 
-        // Cmd+A to select existing text
-        if let selAll = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
-           let selAllUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
-            selAll.flags = .maskCommand
-            selAllUp.flags = .maskCommand
-            selAll.post(tap: .cghidEventTap)
-            usleep(30_000)
-            selAllUp.post(tap: .cghidEventTap)
+        // Use osascript: Cmd+A (select all), Cmd+V (paste), wait for filter, Return
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", """
+            tell application "System Events"
+                keystroke "a" using {command down}
+                delay 0.1
+                keystroke "v" using {command down}
+                delay 0.4
+                keystroke return
+            end tell
+            """]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            Log.warn("selectTrackByNameViaMenu: osascript paste failed: \(error)", subsystem: "ax")
+            return false
         }
-        Thread.sleep(forTimeInterval: 0.05)
 
-        // Cmd+V to paste
-        if let pasteDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
-           let pasteUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) {
-            pasteDown.flags = .maskCommand
-            pasteUp.flags = .maskCommand
-            pasteDown.post(tap: .cghidEventTap)
-            usleep(30_000)
-            pasteUp.post(tap: .cghidEventTap)
-        }
-
-        Thread.sleep(forTimeInterval: 0.3)
-
-        // Press Return to confirm selection
-        guard let returnDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
-              let returnUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else { return false }
-        returnDown.post(tap: .cghidEventTap)
-        returnUp.post(tap: .cghidEventTap)
-
-        // Wait for search dialog to close. The search dialog returns focus to the arrange
-        // area automatically — no need to click. AppleScript keystroke via System Events
-        // will target the frontmost app (Logic Pro) regardless.
+        // Wait for search dialog to close
         Thread.sleep(forTimeInterval: 0.3)
 
         Thread.sleep(forTimeInterval: 0.15)
