@@ -1,4 +1,3 @@
-import CoreGraphics
 import Foundation
 import MCP
 
@@ -503,20 +502,13 @@ struct ProjectDispatcher {
         // --- Execute: for each group, solo those tracks → set cycle → bounce → unsolo ---
         var log: [String] = ["bounce_stems executing for bars \(startBar)–\(endBar):"]
 
-        // Set cycle range first using bar positions
-        let cycleResult = await router.route(
-            operation: "transport.set_cycle_range",
-            params: ["start": "\(startBar).1.1.1", "end": "\(endBar).1.1.1"]
-        )
-        if !cycleResult.isSuccess {
-            log.append("  WARNING: set cycle range failed: \(cycleResult.message)")
-        } else {
+        // Set cycle range using the confirmed-working AX + osascript approach
+        let cycleOk = setCycleRange(startBar: startBar, endBar: endBar)
+        if cycleOk {
             log.append("  Cycle set to bars \(startBar)–\(endBar)")
+        } else {
+            log.append("  WARNING: setCycleRange failed for bars \(startBar)–\(endBar)")
         }
-        _ = await router.route(operation: "transport.toggle_cycle")
-
-        // Determine if we have a pid for CGEvent-based solo toggling
-        let hasPid = ProcessUtils.logicProPID() != nil
 
         for group in groups {
             guard let groupName = group["name"] as? String else { continue }
@@ -524,102 +516,153 @@ struct ProjectDispatcher {
             log.append("  Group '\(groupName)': \(stripNames.joined(separator: ", "))")
 
             var soloedNames: [String] = []
-            var soloedIndices: [Int] = []
 
-            if hasPid && !stripNames.isEmpty {
-                // Prefer name-based selection via Track > Search and Select Track menu
+            if !stripNames.isEmpty {
+                // Solo each track: select by name via menu, then osascript keystroke "s"
                 for stripName in stripNames {
                     let selected = AccessibilityChannel.selectTrackByNameViaMenu(stripName)
                     if selected {
-                        // Post S key via CGEvent to toggle solo on the now-selected track
-                        if let pid = ProcessUtils.logicProPID(),
-                           let source = CGEventSource(stateID: .hidSystemState),
-                           let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: true),
-                           let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: false) {
-                            keyDown.post(tap: .cghidEventTap)
-                            keyUp.post(tap: .cghidEventTap)
+                        usleep(150_000) // 150 ms — let Logic register the selection
+                        let proc = Process()
+                        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                        proc.arguments = ["-e", "tell application \"System Events\" to keystroke \"s\""]
+                        proc.standardOutput = FileHandle.nullDevice
+                        proc.standardError = FileHandle.nullDevice
+                        do {
+                            try proc.run()
+                            proc.waitUntilExit()
                             soloedNames.append(stripName)
-                            log.append("    Soloed '\(stripName)' via menu search + S key")
-                        } else {
-                            log.append("    WARNING: selected '\(stripName)' but S-key post failed")
+                            log.append("    Soloed '\(stripName)' via menu search + osascript keystroke s")
+                        } catch {
+                            log.append("    WARNING: selected '\(stripName)' but osascript keystroke failed: \(error)")
                         }
                     } else {
-                        log.append("    WARNING: could not select '\(stripName)' via menu search; trying AX index fallback")
-                        // Fallback to AX index if available
-                        if let strips = group["strips"] as? [[String: Any]],
-                           let stripNode = strips.first(where: { $0["name"] as? String == stripName }),
-                           let axIdx = stripNode["trackIndex"] as? Int {
-                            let soloResult = await router.route(
-                                operation: "track.set_solo",
-                                params: ["index": "\(axIdx)", "enabled": "true"]
-                            )
-                            if soloResult.isSuccess {
-                                soloedIndices.append(axIdx)
-                            } else {
-                                log.append("    WARNING: AX index solo also failed for '\(stripName)': \(soloResult.message)")
-                            }
-                        }
+                        log.append("    WARNING: could not select '\(stripName)' via menu search — skipping solo")
                     }
                 }
             } else {
-                // No PID or no strip names — fall back to AX index approach
-                let groupAxIndices = group["trackIndices"] as? [Int] ?? []
-                if !groupAxIndices.isEmpty {
-                    for axIdx in groupAxIndices {
-                        let soloResult = await router.route(
-                            operation: "track.set_solo",
-                            params: ["index": "\(axIdx)", "enabled": "true"]
-                        )
-                        if soloResult.isSuccess {
-                            soloedIndices.append(axIdx)
-                        } else {
-                            log.append("    WARNING: solo AX track \(axIdx) failed: \(soloResult.message)")
-                        }
-                    }
-                } else {
-                    // Fallback: solo by MSeq position in info.tracks
-                    let oids = group["stripOids"] as? [Int] ?? []
-                    let mseqOids = (group["mseqOids"] as? [Int]) ?? oids
-                    for (trackIdx, track) in info.tracks.enumerated() where mseqOids.contains(track.oid) {
-                        let soloResult = await router.route(
-                            operation: "track.set_solo",
-                            params: ["index": "\(trackIdx)", "enabled": "true"]
-                        )
-                        if soloResult.isSuccess {
-                            soloedIndices.append(trackIdx)
-                        } else {
-                            log.append("    WARNING: solo track \(trackIdx) (\(track.name)) failed: \(soloResult.message)")
-                        }
-                    }
-                }
+                log.append("    WARNING: no strip names for group '\(groupName)' — cannot solo")
             }
 
             // Open bounce dialog
             let bounceResult = await router.route(operation: "project.bounce_section")
             log.append("    Bounce dialog: \(bounceResult.message)")
 
-            // Un-solo by name (re-press S key on each selected track)
+            // Un-solo by name: select + osascript keystroke "s" to toggle off
             for stripName in soloedNames {
                 let reselected = AccessibilityChannel.selectTrackByNameViaMenu(stripName)
-                if reselected,
-                   let pid = ProcessUtils.logicProPID(),
-                   let source = CGEventSource(stateID: .hidSystemState),
-                   let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: true),
-                   let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: false) {
-                    keyDown.post(tap: .cghidEventTap)
-                    keyUp.post(tap: .cghidEventTap)
+                if reselected {
+                    usleep(150_000) // 150 ms — let Logic register the selection
+                    let proc = Process()
+                    proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                    proc.arguments = ["-e", "tell application \"System Events\" to keystroke \"s\""]
+                    proc.standardOutput = FileHandle.nullDevice
+                    proc.standardError = FileHandle.nullDevice
+                    do {
+                        try proc.run()
+                        proc.waitUntilExit()
+                    } catch {
+                        log.append("    WARNING: unsolo osascript keystroke failed for '\(stripName)': \(error)")
+                    }
+                } else {
+                    log.append("    WARNING: could not re-select '\(stripName)' to unsolo")
                 }
-            }
-            // Un-solo by index (legacy fallback)
-            for idx in soloedIndices {
-                _ = await router.route(
-                    operation: "track.set_solo",
-                    params: ["index": "\(idx)", "enabled": "false"]
-                )
             }
         }
 
         return CallTool.Result(content: [.text(log.joined(separator: "\n"))], isError: false)
+    }
+
+    // MARK: - setCycleRange
+
+    /// Set the Logic Pro cycle range to exact bar positions using the confirmed-working
+    /// Navigate > Go To > Position... dialog + locator keyboard shortcuts.
+    ///
+    /// Steps:
+    ///  1. AX menu: Navigate > Go To > Position... (opens Go To Position dialog)
+    ///  2. osascript: Cmd+A, type "\(startBar) 1 1 1", Return  (moves playhead)
+    ///  3. osascript: Cmd+Ctrl+[  (set left locator to playhead)
+    ///  4. Repeat 1–2 for endBar
+    ///  5. osascript: Cmd+Ctrl+]  (set right locator to playhead)
+    ///  6. osascript: "c"          (enable cycle)
+    @discardableResult
+    private static func setCycleRange(startBar: Int, endBar: Int) -> Bool {
+        func runOsascript(_ script: String) -> Bool {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            proc.arguments = ["-e", script]
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            do {
+                try proc.run()
+                proc.waitUntilExit()
+                return proc.terminationStatus == 0
+            } catch {
+                return false
+            }
+        }
+
+        // Step 1: Open Navigate > Go To > Position...
+        let opened1 = AXLogicProElements.clickMenuItem(path: ["Navigate", "Go To", "Position\u{2026}"])
+                   || AXLogicProElements.clickMenuItem(path: ["Navigate", "Go To", "Position..."])
+        guard opened1 else { return false }
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // Step 2: Select all + type start bar position + Return
+        let typeStart = """
+            tell application "System Events"
+                keystroke "a" using {command down}
+                keystroke "\(startBar) 1 1 1"
+                key code 36
+            end tell
+            """
+        _ = runOsascript(typeStart)
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // Step 3: Set left locator (Cmd+Ctrl+[)
+        let setLeft = """
+            tell application "System Events"
+                key code 33 using {command down, control down}
+            end tell
+            """
+        _ = runOsascript(setLeft)
+        Thread.sleep(forTimeInterval: 0.3)
+
+        // Step 4: Open Navigate > Go To > Position... again
+        let opened2 = AXLogicProElements.clickMenuItem(path: ["Navigate", "Go To", "Position\u{2026}"])
+                   || AXLogicProElements.clickMenuItem(path: ["Navigate", "Go To", "Position..."])
+        guard opened2 else { return false }
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // Step 5: Select all + type end bar position + Return
+        let typeEnd = """
+            tell application "System Events"
+                keystroke "a" using {command down}
+                keystroke "\(endBar) 1 1 1"
+                key code 36
+            end tell
+            """
+        _ = runOsascript(typeEnd)
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // Step 6: Set right locator (Cmd+Ctrl+])
+        let setRight = """
+            tell application "System Events"
+                key code 30 using {command down, control down}
+            end tell
+            """
+        _ = runOsascript(setRight)
+        Thread.sleep(forTimeInterval: 0.3)
+
+        // Step 7: Enable cycle (C key)
+        let enableCycle = """
+            tell application "System Events"
+                keystroke "c"
+            end tell
+            """
+        _ = runOsascript(enableCycle)
+
+        return true
     }
 
     // MARK: - song_lengths
