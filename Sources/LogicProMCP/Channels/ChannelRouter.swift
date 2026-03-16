@@ -11,13 +11,13 @@ actor ChannelRouter {
     /// Static routing table: operation → ordered list of channels to try.
     /// Operations are prefixed by category (e.g., "transport.play", "track.mute").
     private static let routingTable: [String: [ChannelID]] = [
-        // Transport — MMC via CoreMIDI, fallback to keyboard, then AppleScript
-        "transport.play":             [.coreMIDI, .cgEvent, .appleScript],
-        "transport.stop":             [.coreMIDI, .cgEvent, .appleScript],
-        "transport.record":           [.coreMIDI, .cgEvent, .appleScript],
-        "transport.pause":            [.coreMIDI, .cgEvent, .appleScript],
-        "transport.rewind":           [.coreMIDI, .cgEvent],
-        "transport.fast_forward":     [.coreMIDI, .cgEvent],
+        // Transport — CGEvent (keyboard) primary, MMC fallback, then AppleScript
+        "transport.play":             [.cgEvent, .coreMIDI, .appleScript],
+        "transport.stop":             [.cgEvent, .coreMIDI, .appleScript],
+        "transport.record":           [.cgEvent, .coreMIDI, .appleScript],
+        "transport.pause":            [.cgEvent, .coreMIDI, .appleScript],
+        "transport.rewind":           [.cgEvent, .coreMIDI],
+        "transport.fast_forward":     [.cgEvent, .coreMIDI],
         "transport.toggle_cycle":     [.cgEvent, .accessibility],
         "transport.toggle_metronome": [.cgEvent, .accessibility],
         "transport.set_tempo":        [.osc, .accessibility],
