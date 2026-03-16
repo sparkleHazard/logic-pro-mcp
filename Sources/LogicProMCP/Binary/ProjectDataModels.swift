@@ -25,6 +25,73 @@ struct ProjectDataInfo: Sendable, Codable {
     var sampleRate: Int = 0
     /// Project name derived from the .logicx directory name.
     var projectName: String = ""
+
+    // MARK: Extended hierarchy fields
+
+    /// All AuCO channel strips extracted from the project (every guitar, vocal, synth, etc.).
+    /// These are the definitive sub-track enumeration — Logic shows 449 strips vs 13 MSeq tracks.
+    var channelStrips: [ChannelStrip] = []
+    /// Arrangement tracks from Trak chunks, each linked to an MSeq OID.
+    var trakEntries: [TrakEntry] = []
+    /// Environment object names from Envi chunks (stack grouping labels like
+    /// "Backing Track", "Click Track", "Release Track", "Midi Triggers").
+    var environmentLabels: [String] = []
+    /// Full sub-track hierarchy grouped by function group / environment label.
+    /// Each entry is a top-level stack with its channel strip children.
+    var subTrackHierarchy: [SubTrackStack] = []
+}
+
+// MARK: - Channel Strip
+
+/// An AuCO channel strip — the definitive representation of an individual track in Logic Pro.
+/// Logic's mixer has one channel strip per real track (guitar DI, vocal take, synth layer, etc.)
+/// whereas MSeq only stores the top-level arrangement containers.
+struct ChannelStrip: Sendable, Codable {
+    /// Channel strip name (null-terminated ASCII at AuCO body offset 0x3C).
+    /// Examples: "Gtr Clean DI", "Lead Vox", "Rhodes", "Audio 47".
+    var name: String
+    /// Object identifier from the AuCO chunk header.
+    var oid: Int
+    /// Volume in dBFS (40 * log10(raw / 1509949440)). Nil when not decodable.
+    var volume: Double?
+    /// Pan position: -1.0 = hard left, 0.0 = center, +1.0 = hard right. Nil when not decodable.
+    var pan: Double?
+    /// Output routing label (e.g. "Bus 3", "Output 1-2", "Stereo Out").
+    var outputRouting: String?
+    /// Inferred function group (e.g. "Guitars", "Vocals", "Drums", "Keys/Synths").
+    var functionGroup: String?
+    /// True when the name is a generic placeholder (e.g. "Audio 47", "Inst 3").
+    var isGeneric: Bool = false
+    /// OID of the associated Trak chunk (when found by OID proximity matching).
+    var trakOid: Int?
+    /// OID of the MSeq sequence this strip links to (via Trak → MSeq chain).
+    var mseqOid: Int?
+}
+
+// MARK: - Trak Entry
+
+/// An arrangement track from a Trak chunk. Links to an MSeq sequence via mseqOid.
+struct TrakEntry: Sendable, Codable {
+    /// Object identifier from the Trak chunk header.
+    var oid: Int
+    /// OID of the MSeq sequence this track references (at body offset 0x08).
+    var mseqOid: Int
+    /// UUID bytes formatted as standard UUID string (body offset 0x18, 16 bytes).
+    var uuid: String?
+    /// Flags raw value (body offset 0x28, 4 bytes).
+    var flagsRaw: UInt32
+}
+
+// MARK: - Sub-track Hierarchy
+
+/// A top-level stack grouping channel strips by function group / environment label.
+struct SubTrackStack: Sendable, Codable {
+    /// Stack name (e.g. "Guitars", "Vocals", "Backing Track", "Click Track").
+    var name: String
+    /// Source of this grouping: "environment_label", "function_group", or "inferred".
+    var source: String
+    /// Channel strips assigned to this stack.
+    var strips: [ChannelStrip]
 }
 
 // MARK: - Arrangement Markers

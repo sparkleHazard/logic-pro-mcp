@@ -39,6 +39,8 @@ enum ProjectDataParser {
     private static let idAuRg = "AuRg"
     private static let idAuFl = "AuFl"
     private static let idAuCO = "AuCO"
+    private static let idTrak = "Trak"
+    private static let idEnvi = "Envi"
 
     // Unity gain raw value for volume dB formula: dB = 40 * log10(value / unityGain)
     private static let unityGainRaw: Double = 1_509_949_440.0
@@ -133,6 +135,25 @@ enum ProjectDataParser {
         // Extract plugin list
         let plugins = extractPlugins(chunks: chunks, data: data)
 
+        // Extract Trak chunks (arrangement track → MSeq linkage)
+        let trakEntries = extractTrakChunks(chunks: chunks, data: data)
+
+        // Extract Envi environment labels (stack grouping labels)
+        let environmentLabels = extractEnviNames(chunks: chunks, data: data)
+
+        // Extract all AuCO channel strips as sub-track enumeration
+        var channelStrips = extractAllChannelStrips(chunks: chunks, data: data)
+
+        // Wire AuCO → Trak → MSeq chain and infer function groups on strips
+        linkChannelStripsToTrak(strips: &channelStrips, trakEntries: trakEntries)
+        inferFunctionGroupsOnStrips(strips: &channelStrips)
+
+        // Build full sub-track hierarchy from channel strips + environment labels
+        let subTrackHierarchy = buildSubTrackHierarchy(
+            strips: channelStrips,
+            environmentLabels: environmentLabels
+        )
+
         var info = ProjectDataInfo()
         info.markers = markers
         info.tempoMap = tempoMap
@@ -144,6 +165,10 @@ enum ProjectDataParser {
         info.timeSignature = timeSignature
         info.sampleRate = sampleRate
         info.projectName = projectName
+        info.channelStrips = channelStrips
+        info.trakEntries = trakEntries
+        info.environmentLabels = environmentLabels
+        info.subTrackHierarchy = subTrackHierarchy
         return info
     }
 
@@ -1071,7 +1096,9 @@ enum ProjectDataParser {
             end += 1
         }
         guard end > offset else { return "" }
-        return String(data: Data(body[offset..<end]), encoding: .ascii) ?? ""
+        let raw = String(data: Data(body[offset..<end]), encoding: .ascii) ?? ""
+        // Trim leading/trailing whitespace (Logic sometimes stores " Audio 1" with a leading space)
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Scan AuCO body for volume raw value. Returns dB, or nil if no plausible value found.
@@ -1145,6 +1172,484 @@ enum ProjectDataParser {
             }
         }
         return nil
+    }
+
+    // MARK: - Trak Chunk Extraction
+
+    /// Extract arrangement tracks from Trak chunks.
+    ///
+    /// Trak body layout (spec: fixed ~58 bytes):
+    ///   0x08  4B  MSeq reference OID (LE u32)
+    ///   0x18  16B UUID
+    ///   0x28  4B  flags (LE u32)
+    private static func extractTrakChunks(chunks: [ChunkInfo], data: Data) -> [TrakEntry] {
+        var result: [TrakEntry] = []
+        var seen = Set<UInt32>()
+
+        for chunk in chunks where chunk.id == idTrak {
+            guard chunk.bodyLength >= 0x2C else { continue }
+            if !seen.insert(chunk.oid).inserted { continue }
+
+            let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
+
+            // MSeq reference OID at body offset 0x08
+            let mseqOid = readLE32(body, at: 0x08)
+            guard mseqOid != 0 else { continue }  // Skip entries with no MSeq link
+
+            // UUID: 16 bytes at body offset 0x18
+            var uuid: String? = nil
+            if body.count >= 0x28 {
+                let uuidBytes = Data(body[0x18..<0x28])
+                uuid = formatUUID(uuidBytes)
+            }
+
+            // Flags at body offset 0x28
+            let flagsRaw = body.count >= 0x2C ? readLE32(body, at: 0x28) : 0
+
+            result.append(TrakEntry(
+                oid: Int(chunk.oid),
+                mseqOid: Int(mseqOid),
+                uuid: uuid,
+                flagsRaw: flagsRaw
+            ))
+        }
+
+        return result
+    }
+
+    /// Format 16 bytes as a standard UUID string (8-4-4-4-12 hex groups).
+    private static func formatUUID(_ bytes: Data) -> String? {
+        guard bytes.count >= 16 else { return nil }
+        let hex = bytes.map { String(format: "%02x", $0) }.joined()
+        guard hex.count == 32 else { return nil }
+        // Build UUID string manually to avoid Swift type-checker complexity
+        var result = ""
+        for (i, ch) in hex.enumerated() {
+            result.append(ch)
+            if i == 7 || i == 11 || i == 15 || i == 19 {
+                result.append("-")
+            }
+        }
+        // Return nil for all-zero UUID
+        return result == "00000000-0000-0000-0000-000000000000" ? nil : result
+    }
+
+    // MARK: - Envi Name Extraction
+
+    /// Extract environment object names from Envi chunks.
+    ///
+    /// Per the spec, Envi chunks contain environment objects with a name.
+    /// Each Envi body is scanned for the first meaningful printable ASCII run.
+    /// The buildSubTrackHierarchy step filters GM instrument names and noise.
+    private static func extractEnviNames(chunks: [ChunkInfo], data: Data) -> [String] {
+        var names: [String] = []
+        var seen = Set<String>()
+
+        for chunk in chunks where chunk.id == idEnvi {
+            guard chunk.bodyLength >= 4 else { continue }
+            let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
+
+            if let name = extractEnviName(body: body), !name.isEmpty {
+                if seen.insert(name).inserted {
+                    names.append(name)
+                }
+            }
+        }
+
+        return names
+    }
+
+    /// Scan an Envi body for the first plausible printable ASCII name.
+    ///
+    /// Envi bodies in this project store names as contiguous printable ASCII runs
+    /// (not length-prefixed). We scan the full body for the first run of 3-80
+    /// printable bytes that contains at least one letter and passes noise filters.
+    ///
+    /// Noise filters exclude: output labels ("Output N"), system names
+    /// ("Input View", "GM Device", "Preview", "Master", "Stereo Out"),
+    /// and strings starting with "@" or "/".
+    private static let enviNoiseNames: Set<String> = [
+        "not assigned", "input view", "input notes", "preview",
+        "master", "stereo out", "physical input", "sequencer input",
+        "gm device", "edit output",
+        "output 4", "output 9-10", "output 11-12",
+        "output 25-26", "output 27-28", "output 29-30", "output 31-32",
+    ]
+
+    private static func extractEnviName(body: Data) -> String? {
+        var run = ""
+        var bestRun: String? = nil
+
+        for byte in body {
+            if byte >= 0x20 && byte < 0x7F {
+                run.append(Character(Unicode.Scalar(byte)))
+            } else {
+                if let candidate = validateEnviRun(run) {
+                    if bestRun == nil { bestRun = candidate }
+                }
+                run = ""
+            }
+        }
+        // Flush last run
+        if let candidate = validateEnviRun(run), bestRun == nil {
+            bestRun = candidate
+        }
+
+        return bestRun
+    }
+
+    private static func validateEnviRun(_ run: String) -> String? {
+        let trimmed = run.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 3 && trimmed.count <= 80 else { return nil }
+        guard trimmed.contains(where: { $0.isLetter }) else { return nil }
+        let lower = trimmed.lowercased()
+        guard !lower.hasPrefix("@"), !lower.hasPrefix("/"), !lower.hasPrefix("http") else { return nil }
+        // Filter noise names
+        if enviNoiseNames.contains(lower) { return nil }
+        // Filter "Output N" patterns
+        if lower.hasPrefix("output ") && lower.dropFirst(7).allSatisfy({ $0.isNumber || $0 == "-" }) { return nil }
+        return trimmed
+    }
+
+    // MARK: - AuCO Channel Strip Extraction (Full Enumeration)
+
+    /// Extract ALL AuCO channel strips as sub-track enumeration.
+    ///
+    /// Unlike enrichTracksWithAuCO (which only patches existing MSeq tracks),
+    /// this function returns every channel strip found — including all individual
+    /// guitars, vocals, keys, synth layers etc. that never appear as MSeq entries.
+    ///
+    /// Key insight: AuCO chunks in many projects share a small set of OIDs but
+    /// each body encodes a different channel strip name. We deduplicate by name
+    /// (after trimming) rather than by OID to capture all 449 strips.
+    ///
+    /// AuCO body layout:
+    ///   0x3C  null-terminated ASCII  name (up to 64 bytes)
+    ///   0x59  1B                     pan byte (0=hard left, 64=center, 127=hard right)
+    ///   0x74  4B LE u32              volume raw (unity = 1509949440)
+    private static func extractAllChannelStrips(chunks: [ChunkInfo], data: Data) -> [ChannelStrip] {
+        var result: [ChannelStrip] = []
+        var seenNames = Set<String>()
+        var seenOids = Set<UInt32>()     // track first-OID-seen for OID assignment
+        var syntheticIndex = 0          // for OID-less strips
+
+        for chunk in chunks where chunk.id == idAuCO {
+            guard chunk.bodyLength > 0x5A else { continue }
+
+            let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
+
+            // Name: null-terminated ASCII at 0x3C (up to 64 bytes), trimmed
+            let name = readNullTerminatedASCII(body, at: 0x3C, maxLen: 64)
+            let trimmedName = name.isEmpty ? "" : name
+
+            // Skip duplicate names (same channel strip appearing in multiple bodies)
+            let dedupeKey = trimmedName.isEmpty ? "__empty_\(syntheticIndex)" : trimmedName
+            guard seenNames.insert(dedupeKey).inserted else { continue }
+            if trimmedName.isEmpty { syntheticIndex += 1 }
+
+            // Pan byte at 0x59
+            let panByte = Int(body[0x59])
+            let panNorm: Double = (Double(panByte) - 64.0) / 64.0
+
+            // Volume
+            let volumeDB = readVolumeDB(body: body)
+
+            // Output routing
+            let outputRouting = extractOutputRouting(body: body)
+
+            // Is generic? ("Audio N", "Input N", "Bus N", etc.)
+            let isGeneric = isGenericChannelStripName(trimmedName)
+
+            // OID: use chunk OID if not yet assigned, otherwise use synthetic
+            let oid: Int
+            if seenOids.insert(chunk.oid).inserted {
+                oid = Int(chunk.oid)
+            } else {
+                // Synthesize a unique OID for strips that share the chunk OID
+                // Use a high-bit offset to avoid collision with real OIDs
+                oid = Int(chunk.oid) * 1000 + result.count
+            }
+
+            result.append(ChannelStrip(
+                name: trimmedName.isEmpty ? "Strip \(oid)" : trimmedName,
+                oid: oid,
+                volume: volumeDB,
+                pan: panNorm.clamped(to: -1.0...1.0),
+                outputRouting: outputRouting,
+                functionGroup: nil,
+                isGeneric: isGeneric,
+                trakOid: nil,
+                mseqOid: nil
+            ))
+        }
+
+        return result
+    }
+
+    /// Returns true when a channel strip name is a generic placeholder.
+    /// Patterns: "Audio N", "Inst N", "Bus N", "Output N", "Input N", "Ext. Inst N", empty, etc.
+    private static func isGenericChannelStripName(_ name: String) -> Bool {
+        guard !name.isEmpty else { return true }
+        let lower = name.lowercased()
+
+        // Pure numeric suffix patterns
+        let genericPrefixes = [
+            "audio ", "inst ", "bus ", "output ", "input ", "ext. inst ",
+            "software instrument ", "aux ", "stereo out",
+            "physical input", "sequencer input", "not assigned",
+        ]
+        for prefix in genericPrefixes {
+            if lower.hasPrefix(prefix) {
+                // Allow if remainder is not pure digits (user may have named it "Audio Guitar")
+                let rest = lower.dropFirst(prefix.count)
+                if rest.isEmpty || rest.allSatisfy({ $0.isNumber || $0 == "-" || $0 == " " }) {
+                    return true
+                }
+            }
+        }
+        // Exact matches that are always generic
+        if lower == "stereo out" || lower == "master" || lower == "not assigned" { return true }
+
+        // All-digit names
+        if name.allSatisfy({ $0.isNumber }) { return true }
+
+        return false
+    }
+
+    // MARK: - AuCO → Trak → MSeq Chain
+
+    /// Link channel strips to Trak entries (and via Trak, to MSeq).
+    ///
+    /// Strategy:
+    ///   1. Exact OID match: AuCO.oid == Trak.oid
+    ///   2. Proximity: nearest Trak OID within ±8 of AuCO.oid
+    private static func linkChannelStripsToTrak(
+        strips: inout [ChannelStrip],
+        trakEntries: [TrakEntry]
+    ) {
+        guard !trakEntries.isEmpty else { return }
+
+        // Build OID → Trak map
+        var trakByOid: [Int: TrakEntry] = [:]
+        for t in trakEntries {
+            trakByOid[t.oid] = t
+        }
+        let sortedTrakOids = trakEntries.map { $0.oid }.sorted()
+
+        for i in strips.indices {
+            let stripOid = strips[i].oid
+
+            // 1. Exact match
+            if let trak = trakByOid[stripOid] {
+                strips[i].trakOid = trak.oid
+                strips[i].mseqOid = trak.mseqOid
+                continue
+            }
+
+            // 2. Nearest within ±8
+            var bestDist = 9
+            var bestTrak: TrakEntry? = nil
+            for tOid in sortedTrakOids {
+                let dist = abs(stripOid - tOid)
+                if dist < bestDist {
+                    bestDist = dist
+                    bestTrak = trakByOid[tOid]
+                }
+            }
+            if let trak = bestTrak {
+                strips[i].trakOid = trak.oid
+                strips[i].mseqOid = trak.mseqOid
+            }
+        }
+    }
+
+    /// Infer function groups on channel strips using name keywords.
+    private static func inferFunctionGroupsOnStrips(strips: inout [ChannelStrip]) {
+        for i in strips.indices {
+            strips[i].functionGroup = inferGroupFromText(strips[i].name)
+        }
+    }
+
+    // MARK: - Sub-track Hierarchy Builder
+
+    /// Build the full sub-track hierarchy from channel strips and environment labels.
+    ///
+    /// Algorithm:
+    ///   1. If environment labels contain non-generic names (song/project-specific names),
+    ///      use them as the sub-track catalog — they map directly to Logic's Environment
+    ///      and represent each actual mixer channel.
+    ///   2. Assign each environment-label sub-track to an environment stack using keyword
+    ///      matching against canonical stack labels.
+    ///   3. For any named AuCO channel strips, also include them in the hierarchy.
+    ///   4. Filter noise from the environment labels (GM instrument names, system labels).
+    private static func buildSubTrackHierarchy(
+        strips: [ChannelStrip],
+        environmentLabels: [String]
+    ) -> [SubTrackStack] {
+        // Canonical environment stack labels (in display order)
+        let canonicalStackLabels: [(label: String, keywords: [String])] = [
+            ("Click Track",    ["click", "metronome", "midi click"]),
+            ("Midi Triggers",  ["midi", "trigger", "cortex", "quad", "nano", "wled"]),
+            ("Backing Track",  ["backing"]),
+            ("Release Track",  ["release"]),
+            ("Drums",          ["drum", "kick", "snare", "perc"]),
+            ("Guitars",        ["guitar", "gtr", "clean", "distort", "guitare"]),
+            ("Vocals",         ["vocal", "vox", "harmony", "choir", "voice"]),
+            ("Keys/Synths",    ["key", "piano", "organ", "synth", "rhodes"]),
+            ("Bass",           ["bass"]),
+            ("Strings",        ["string", "violin", "viola", "cello"]),
+            ("Samples/FX",     ["sample", "sfx", "texture", "soundscape", "ambient", "loop"]),
+            ("Songs",          ["intro", "verse", "chorus", "bridge", "breakdown", "transition",
+                                "the last light", "in her eyes", "reborn", "fortitude",
+                                "new beginnings", "dead", "buried", "twdtd", "ihe"]),
+        ]
+
+        // Known noise patterns for environment labels (not real sub-tracks)
+        let gmInstruments: Set<String> = [
+            "accordion fr", "acoustic bs.", "agogo", "alto sax", "applause", "atmosphere",
+            "bag pipe", "banjo", "baritone sax", "bass&lead", "bassoon", "bird", "blown bottle",
+            "bowed glass", "brass 1", "breath noise", "bright piano", "brightness", "celesta",
+            "cello", "charang", "chiffer lead", "choir aahs", "church organ1", "clarinet",
+            "clavinet", "clean gt.", "contrabass", "crystal", "distortion gt", "draworgan",
+            "dulcimer", "e. piano1", "e. piano2", "echo drops", "electricgrand", "english horn",
+            "fantasia", "fiddle", "fingered bs.", "flute", "french horn", "fretless bs.",
+            "glockenspiel", "goblin", "grand piano", "gt fretnoise", "gt.harmonics",
+            "gun shot", "halo pad", "harmonica", "harp", "harpsichord", "helicopter",
+            "honkytonkpno.", "ice rain", "jazz gt.", "kalimba", "koto", "marimba", "melo tom",
+            "metal pad", "music box", "muted gt.", "mutedtrumpet", "nylonstr. gt.", "oboe",
+            "ocarina", "orchestrahit", "overdrive gt.", "pan flute", "percorgan", "piccolo",
+            "picked bs.", "pizzicato str", "polysynth", "recorder", "reed organ", "reverse cym.",
+            "rockorgan", "saw wave", "seashore", "shakuhachi", "shamisen", "shanai", "sitar",
+            "slap bass 1", "slap bass 2", "slow strings", "solo vox", "soprano sax", "soundtrack",
+            "space voice", "square wave", "star theme", "steel drums", "steelstr. gt.", "strings",
+            "sweep pad", "syn. calliope", "syn. strings1", "syn. strings2", "synvox",
+            "synth bass 1", "synth bass 2", "synth brass1", "synth brass2", "synth drum",
+            "tangoacd", "telephone 1", "tenor sax", "timpani", "tinkle bell", "tremolo str.",
+            "trombone", "trumpet", "tuba", "tubular-bell", "vibraphone", "viola", "violin",
+            "voice oohs", "warm pad", "whistle", "woodblock", "xylophone",
+            "5th saw wave", "e<j", "m#v", "o4i", "s9ie", "ax%", "dto", "h%ns", "n91q",
+            "no2", "}=l", "e<j", "*$v", "*6uw", "<bo", "dro",
+            // System/router objects
+            "gm device", "(folder)",
+        ]
+
+        // Filter environment labels to meaningful project-specific names
+        let projectLabels = environmentLabels.filter { label in
+            let lower = label.lowercased()
+            if gmInstruments.contains(lower) { return false }
+            // Skip short noise (2-3 char random strings)
+            if label.count <= 2 { return false }
+            // Skip strings that look like binary noise (no vowels)
+            let vowels = Set<Character>("aeiouAEIOU")
+            if label.count <= 4 && !label.contains(where: { vowels.contains($0) }) { return false }
+            return true
+        }
+
+        // Build map: stack label → sub-track names
+        var stackMap: [String: [String]] = [:]
+        var unassigned: [String] = []
+
+        for label in projectLabels {
+            let lower = label.lowercased()
+            var assigned = false
+
+            // Check canonical stacks
+            for stackDef in canonicalStackLabels {
+                let matchesKeyword = stackDef.keywords.contains { kw in
+                    lower.contains(kw)
+                }
+                if matchesKeyword {
+                    stackMap[stackDef.label, default: []].append(label)
+                    assigned = true
+                    break
+                }
+            }
+
+            if !assigned {
+                unassigned.append(label)
+            }
+        }
+
+        // Build sub-track stacks
+        var stacks: [SubTrackStack] = []
+
+        // Named AuCO strips (if any are non-generic)
+        let namedStrips = strips.filter { !$0.isGeneric }
+
+        // Canonical stack order
+        for stackDef in canonicalStackLabels {
+            guard let labelGroup = stackMap[stackDef.label], !labelGroup.isEmpty else { continue }
+
+            // Convert label group to ChannelStrip objects (synthetic, from Envi labels)
+            let stackStrips: [ChannelStrip] = labelGroup.map { label in
+                // Try to find a real AuCO strip with matching name
+                let matchedStrip = namedStrips.first { s in
+                    s.name.lowercased() == label.lowercased()
+                }
+                if let s = matchedStrip { return s }
+                // Create synthetic strip from Envi label
+                return ChannelStrip(
+                    name: label,
+                    oid: 0,
+                    volume: nil,
+                    pan: nil,
+                    outputRouting: nil,
+                    functionGroup: stackDef.label,
+                    isGeneric: false,
+                    trakOid: nil,
+                    mseqOid: nil
+                )
+            }
+
+            stacks.append(SubTrackStack(
+                name: stackDef.label,
+                source: "environment_label",
+                strips: stackStrips.sorted { $0.name < $1.name }
+            ))
+        }
+
+        // Unassigned project labels
+        if !unassigned.isEmpty {
+            let unassignedStrips = unassigned.map { label -> ChannelStrip in
+                ChannelStrip(
+                    name: label,
+                    oid: 0,
+                    volume: nil,
+                    pan: nil,
+                    outputRouting: nil,
+                    functionGroup: nil,
+                    isGeneric: false,
+                    trakOid: nil,
+                    mseqOid: nil
+                )
+            }
+            stacks.append(SubTrackStack(
+                name: "Other",
+                source: "environment_label",
+                strips: unassignedStrips.sorted { $0.name < $1.name }
+            ))
+        }
+
+        // Any non-generic AuCO strips not already in a stack
+        let inStackNames = Set(stacks.flatMap { $0.strips.map { $0.name.lowercased() } })
+        let remainingStrips = namedStrips.filter { !inStackNames.contains($0.name.lowercased()) }
+        if !remainingStrips.isEmpty {
+            // Group remaining by function group
+            var fgMap: [String: [ChannelStrip]] = [:]
+            for s in remainingStrips {
+                let fg = s.functionGroup ?? "Other"
+                fgMap[fg, default: []].append(s)
+            }
+            for fg in fgMap.keys.sorted() {
+                stacks.append(SubTrackStack(
+                    name: fg,
+                    source: "function_group",
+                    strips: fgMap[fg]!.sorted { $0.name < $1.name }
+                ))
+            }
+        }
+
+        return stacks
     }
 
     // MARK: - Plugin List

@@ -165,11 +165,10 @@ struct ProjectDispatcher {
             )
         }
 
-        // Build OID -> track map for the public tracks array
+        // --- Section 1: MSeq-level arrangement tracks (existing) ---
         let tracks = info.tracks
         let oidToTrack: [Int: ParsedTrack] = Dictionary(uniqueKeysWithValues: tracks.map { ($0.oid, $0) })
 
-        // Encode a track node (without full regions list to keep output concise)
         func encodeNode(_ t: ParsedTrack) -> [String: Any] {
             var node: [String: Any] = [
                 "name": t.name,
@@ -187,7 +186,6 @@ struct ProjectDispatcher {
             return node
         }
 
-        // Separate stack roots (has children, no parent in public set) from ungrouped
         let publicOids = Set(tracks.map { $0.oid })
         let stacks = tracks.filter { t in
             !t.childOids.isEmpty && (t.parentOid == nil || !publicOids.contains(t.parentOid!))
@@ -201,11 +199,46 @@ struct ProjectDispatcher {
             return node
         }
 
+        // --- Section 2: Full sub-track hierarchy from AuCO channel strips ---
+        let subHierarchy = info.subTrackHierarchy.map { stack -> [String: Any] in
+            let stripNodes = stack.strips.map { strip -> [String: Any] in
+                var node: [String: Any] = [
+                    "name": strip.name,
+                    "oid": strip.oid,
+                    "isGeneric": strip.isGeneric,
+                ]
+                if let fg = strip.functionGroup { node["functionGroup"] = fg }
+                if let routing = strip.outputRouting { node["outputRouting"] = routing }
+                if let vol = strip.volume { node["volumeDB"] = String(format: "%.1f", vol) }
+                if let tOid = strip.trakOid { node["trakOid"] = tOid }
+                if let mOid = strip.mseqOid { node["mseqOid"] = mOid }
+                return node
+            }
+            return [
+                "name": stack.name,
+                "source": stack.source,
+                "stripCount": stack.strips.count,
+                "strips": stripNodes,
+            ]
+        }
+
+        // --- Counts ---
+        let totalStrips = info.channelStrips.count
+        let namedStrips = info.channelStrips.filter { !$0.isGeneric }.count
+        let envLabels = info.environmentLabels
+
         let result: [String: Any] = [
             "project": info.projectName,
-            "trackCount": tracks.count,
-            "stacks": stacks,
-            "ungrouped": ungrouped,
+            "mseqTrackCount": tracks.count,
+            "channelStripCount": totalStrips,
+            "namedChannelStrips": namedStrips,
+            "trakEntryCount": info.trakEntries.count,
+            "environmentLabels": envLabels,
+            "arrangementTracks": [
+                "stacks": stacks,
+                "ungrouped": ungrouped,
+            ],
+            "subTrackHierarchy": subHierarchy,
         ]
 
         guard let jsonData = try? JSONSerialization.data(
@@ -225,7 +258,7 @@ struct ProjectDispatcher {
     /// Params:
     ///   - path: .logicx path (optional, auto-detected if omitted)
     ///   - marker_name / start_bar + end_bar: section to bounce
-    ///   - groups: array of function group names to include (nil = all)
+    ///   - groups: array of function group / stack names to include (nil = all)
     ///   - execute: Bool (default false) — when true, solo + bounce each group
     private static func bounceStems(
         params: [String: Value],
@@ -280,7 +313,7 @@ struct ProjectDispatcher {
             endBar = (info.markers.map { $0.bar + $0.durationBars }.max() ?? 9) + 1
         }
 
-        // --- Build function group → tracks mapping ---
+        // --- Build stem groups from sub-track hierarchy (channel strips) ---
         let requestedGroups: Set<String>?
         if let gArr = params["groups"],
            case let Value.array(gVals) = gArr {
@@ -289,27 +322,52 @@ struct ProjectDispatcher {
             requestedGroups = nil
         }
 
-        // Group tracks by function group (leaf tracks only — those with regions)
-        var groupMap: [String: [ParsedTrack]] = [:]
-        for track in info.tracks {
-            guard let group = track.functionGroup else { continue }
-            if let requested = requestedGroups, !requested.contains(group) { continue }
-            groupMap[group, default: []].append(track)
-        }
+        // Use subTrackHierarchy as primary source (channel strips grouped by stack/function group)
+        // Fall back to MSeq-based grouping if no channel strips found
+        var groups: [[String: Any]] = []
 
-        // Sort groups deterministically
-        let groups = groupMap.keys.sorted().map { groupName -> [String: Any] in
-            let members = groupMap[groupName]!
-            return [
-                "name": groupName,
-                "trackOids": members.map { $0.oid },
-                "trackNames": members.map { $0.name },
-            ]
+        if !info.subTrackHierarchy.isEmpty {
+            // Channel-strip-based groups (the full 449 sub-tracks)
+            for stack in info.subTrackHierarchy {
+                if let requested = requestedGroups, !requested.contains(stack.name) { continue }
+
+                // Filter to non-generic strips (they have real content)
+                let meaningfulStrips = stack.strips.filter { !$0.isGeneric }
+                if meaningfulStrips.isEmpty { continue }
+
+                groups.append([
+                    "name": stack.name,
+                    "source": stack.source,
+                    "stripOids": meaningfulStrips.map { $0.oid },
+                    "stripNames": meaningfulStrips.map { $0.name },
+                    "mseqOids": Array(Set(meaningfulStrips.compactMap { $0.mseqOid })).sorted(),
+                ])
+            }
+        } else {
+            // Fallback: group MSeq tracks by function group (legacy behaviour)
+            var groupMap: [String: [ParsedTrack]] = [:]
+            for track in info.tracks {
+                guard let group = track.functionGroup else { continue }
+                if let requested = requestedGroups, !requested.contains(group) { continue }
+                groupMap[group, default: []].append(track)
+            }
+            for groupName in groupMap.keys.sorted() {
+                let members = groupMap[groupName]!
+                groups.append([
+                    "name": groupName,
+                    "source": "function_group_mseq",
+                    "stripOids": members.map { $0.oid },
+                    "stripNames": members.map { $0.name },
+                    "mseqOids": members.map { $0.oid },
+                ])
+            }
         }
 
         let plan: [String: Any] = [
             "song": info.projectName,
             "bars": [startBar, endBar],
+            "channelStripCount": info.channelStrips.count,
+            "namedStrips": info.channelStrips.filter { !$0.isGeneric }.count,
             "groups": groups,
         ]
 
@@ -342,15 +400,16 @@ struct ProjectDispatcher {
 
         for group in groups {
             guard let groupName = group["name"] as? String,
-                  let oids = group["trackOids"] as? [Int],
-                  let names = group["trackNames"] as? [String] else { continue }
+                  let oids = group["stripOids"] as? [Int],
+                  let names = group["stripNames"] as? [String] else { continue }
 
             log.append("  Group '\(groupName)': \(names.joined(separator: ", "))")
 
-            // Solo tracks by index (best-effort — AX index may differ from binary OID)
-            // We use the track index in the public tracks array
+            // Solo tracks by index — use MSeq track indices where available,
+            // falling back to position in the public tracks array for OID proximity
             var soloedIndices: [Int] = []
-            for (trackIdx, track) in info.tracks.enumerated() where oids.contains(track.oid) {
+            let mseqOids = (group["mseqOids"] as? [Int]) ?? oids
+            for (trackIdx, track) in info.tracks.enumerated() where mseqOids.contains(track.oid) {
                 let soloResult = await router.route(
                     operation: "track.set_solo",
                     params: ["index": "\(trackIdx)", "enabled": "true"]

@@ -1,0 +1,359 @@
+        elif cid == "Trak":
+            entry = trak_entries.get(oid, {"oid": oid})
+            if len(body) >= 0x0C:
+                mseq_oid = struct.unpack('<I', body[0x08:0x0C])[0]
+                if mseq_oid:
+                    entry["mseq_oid"] = mseq_oid
+            if len(body) >= 0x28:
+                uuid = format_uuid(body[0x18:0x28])
+                if uuid:
+                    entry["uuid"] = uuid
+            if len(body) >= 0x2C:
+                entry["flags_raw"] = struct.unpack('<I', body[0x28:0x2C])[0]
+            trak_entries[oid] = entry
+
+        elif cid in ["AuCO", "AuCn", "AuCU"]:
+            if oid not in channel_strips:
+                channel_strips[oid] = {
+                    "oid": oid,
+                    "mixer": {},
+                    "routing": False,
+                    "automation_lanes": 0,
+                    "_config_records": [],
+                    "_routing_records": [],
+                    "_automation_records": []
+                }
+            if cid == "AuCO":
+                channel_strips[oid]["_config_records"].append(body)
+                try:
+                    v_raw = struct.unpack('<I', body[0x74:0x78])[0]
+                    p_raw = body[0x59]
+                    name = read_null_terminated_ascii(body, 0x3C, 64)
+                    output_label = None
+                    for s in re.findall(b'[\x20-\x7E]{4,}', body):
+                        if b'Output' in s or b'Bus' in s or b'Stereo Out' in s:
+                            output_label = s.decode('ascii', errors='ignore').strip()
+                            break
+                    channel_strips[oid]["mixer"] = {"vol": raw_to_db(v_raw), "pan": p_raw}
+                    if name:
+                        channel_strips[oid]["name"] = name
+                    if output_label:
+                        channel_strips[oid]["output"] = output_label
+                except Exception:
+                    pass
+            elif cid == "AuCn":
+                channel_strips[oid]["routing"] = True
+                channel_strips[oid]["_routing_records"].append(body)
+            elif cid == "AuCU":
+                channel_strips[oid]["automation_lanes"] += 1
+                channel_strips[oid]["_automation_records"].append(body)
+
+        elif cid == "AuRg":
+            aurg_chunks.append((oid, body))
+
+        elif cid in ["TxSq", "TxSt"]:
+            try:
+                txt = body.decode('ascii', errors='ignore')
+                if "{" in txt:
+                    cleaned = clean_logic_text(txt)
+                    if cleaned:
+                        tx_texts[oid] = cleaned
+                        if len(cleaned) > 2:
+                            project["summary"]["markers"].append({"name": cleaned, "oid": oid})
+                            if cid == "TxSq":
+                                project["summary"]["arrangement_markers"].append({
+                                    "name": cleaned,
+                                    "source": "txsq",
+                                    "oid": oid
+                                })
+            except Exception:
+                pass
+
+        elif cid == "EvSq":
+            evsq_chunks.append({
+                "oid": oid,
+                "body": body,
+                "start": ch.get("start")
+            })
+    environment_objects = []
+    env_seen = set()
+    non_ascii_chunks = []
+
+    for ch in iter_chunks(data):
+        cid = ch["cid"]
+        oid = ch["oid"]
+        body = ch["body"]
+        cid_bytes = ch["cid_bytes"]
+
+        if not all(32 <= b < 127 for b in cid_bytes):
+            # Skip plugin data (null ID) and zero-length placeholders
+            if cid_bytes != b'\x00\x00\x00\x00' and ch["length"] > 0:
+                non_ascii_chunks.append(ch)
+
+        if cid == "AuFl":
+            try:
+                name_len = struct.unpack('<H', body[8:10])[0]
+                if 0 < name_len < 1000:
+                    raw_bytes = body[10 : 10 + (name_len * 2)]
+                    path = raw_bytes.decode('utf-16le', errors='ignore')
+                    audio_files[oid] = os.path.basename(path)
+                    project["summary"]["audio_assets"].append({"name": path, "oid": oid})
+            except Exception:
+                pass
+
+        elif cid == "MSeq":
+            name = parse_mseq_name(body)
+            if name:
+                mseq_names[oid] = name
+            if len(body) >= 0x0C:
+                try:
+                    ref_oid = struct.unpack('<I', body[0x08:0x0C])[0]
+                    if ref_oid and ref_oid != oid:
+                        mseq_parent_refs[oid] = ref_oid
+                except Exception:
+                    pass
+
+        elif cid == "Trak":
+            entry = trak_entries.get(oid, {"oid": oid})
+
+    for name in catalog_names:
+        norm, _ = normalize_tokens(name)
+        base_track_id = f"env:{norm}" if norm else f"env:{next_oid}"
+        track_id = base_track_id
+        suffix = 2
+        while track_id in used_track_ids:
+            track_id = f"{base_track_id}:{suffix}"
+            suffix += 1
+        used_track_ids.add(track_id)
+
+        stack_hint = infer_stack_hint_from_label(name, release_title_hints=release_title_hints)
+        entry = {
+            "oid": next_oid,
+            "mseq_oid": None,
+            "uuid": None,
+            "regions": [],
+            "name": name,
+            "name_raw": name,
+            "display_name": name,
+            "name_is_generic": False,
+            "name_aliases": [name],
+            "name_norm": norm or None,
+            "track_id": track_id,
+            "track_stack": {
+                "type": "none",
+                "is_summing": False,
+                "source": "environment_label_catalog",
+                "confidence": 0.2
+            },
+            "is_summing_track_stack": False,
+            "synthetic": True,
+            "synthetic_source": "environment_label_catalog"
+        }
+        if stack_hint:
+            entry["top_level_stack_name"] = stack_hint
+            entry["top_level_stack_confidence"] = 0.35
+            entry["top_level_stack_source"] = "environment_label_catalog"
+        final_tracks[next_oid] = entry
+        synthetic_entries.append({
+            "oid": next_oid,
+            "name": name,
+            "stack_hint": stack_hint
+        })
+        next_oid += 1
+
+    return synthetic_entries
+
+def curate_track_aliases(track, release_title_hints=None):
+    if not isinstance(track, dict):
+        return
+
+    aliases = track.get("name_aliases")
+    if not isinstance(aliases, list) or not aliases:
+        return
+
+    primary = track.get("display_name") or track.get("name") or track.get("name_raw") or ""
+    primary_lower = str(primary).lower()
+    primary_norm, primary_tokens = normalize_tokens(primary)
+    release_hints = release_title_hints if isinstance(release_title_hints, set) else set()
+
+    midi_tokens = {"midi", "trigger", "triggers", "cortex", "quad", "nano", "wled"}
+    midi_primary = bool(primary_tokens.intersection(midi_tokens))
+    master_primary = ("master live project" in primary_lower) or (primary_norm in {"master live", "master live project"})
+    release_primary = bool(primary_norm and primary_norm in release_hints)
+
+    filtered = []
+    seen = set()
+    for alias in aliases:
+        if not isinstance(alias, str) or not alias.strip():
+            continue
+        alias_value = alias.strip()
+        alias_norm, alias_tokens = normalize_tokens(alias_value)
+        if not alias_norm and not alias_value.startswith("*"):
+            continue
+
+        if master_primary and alias_norm:
+            keep_master_alias = (
+                "master" in alias_tokens
+                or "automation" in alias_tokens
+                or alias_norm in {"master live", "master live project"}
+        "not assigned",
+        "input view",
+        "input notes",
+        "preview",
+        "master",
+        "stereo out",
+        "physical input",
+        "sequencer input",
+        "gm device",
+        "edit output",
+        "output 4",
+        "output 25-26",
+        "output 27-28",
+        "output 29-30",
+        "output 31-32"
+    }
+    role_tokens = {"click", "backing", "release", "midi", "trigger", "triggers"}
+    canonical_stack_labels = {"midi triggers", "click track", "backing track", "release track"}
+    midi_profile_tokens = {"midi", "trigger", "triggers", "cortex", "quad", "nano", "wled"}
+    release_title_hints = build_release_title_hints(environment_layout_map, environment_labels)
+
+    environment_names = set()
+    for raw in environment_labels or []:
+        if isinstance(raw, str) and raw.strip():
+            environment_names.add(raw.strip())
+    if isinstance(environment_layout_map, dict):
+        for payload in environment_layout_map.values():
+            if not isinstance(payload, dict):
+                continue
+            name = payload.get("name")
+            if isinstance(name, str) and name.strip():
+                environment_names.add(name.strip())
+
+    # Build token profiles per track from name + aliases + region names/files.
+    track_profiles = {}
+    for oid, track in final_tracks.items():
+        fragments = []
+        name = track.get("name")
+        if isinstance(name, str) and name.strip():
+            fragments.append(name.strip())
+        display_name = track.get("display_name")
+        if isinstance(display_name, str) and display_name.strip():
+            fragments.append(display_name.strip())
+        root_name = track.get("stack_root_name")
+        if isinstance(root_name, str) and root_name.strip():
+            fragments.append(root_name.strip())
+        stack_name = track.get("top_level_stack_name")
+        if isinstance(stack_name, str) and stack_name.strip():
+            fragments.append(stack_name.strip())
+        aliases = track.get("name_aliases")
+        if isinstance(aliases, list):
+            for alias in aliases:
+                if isinstance(alias, str) and alias.strip():
+                    fragments.append(alias.strip())
+
+        norms = []
+        tokens = set()
+        seen_fragment = set()
+        for fragment in fragments:
+            lowered = fragment.lower()
+            if lowered in seen_fragment:
+                continue
+            seen_fragment.add(lowered)
+            norm, tok = normalize_tokens(fragment)
+            if norm:
+                norms.append(norm)
+            tokens.update(tok)
+
+        track_profiles[oid] = {
+            "region_count": len(track.get("regions", [])),
+            "norms": norms,
+            "tokens": tokens
+        }
+
+    # Score environment labels against each region-carrying track.
+    env_to_winners = {}
+    for env_name in sorted(environment_names):
+        if not is_sane_name(env_name):
+            continue
+        lowered_env = env_name.lower().strip()
+        if lowered_env.startswith("@"):
+    return cleaned in generic
+
+def build_track_name_candidates(oid, entry, mseq_names, tx_texts, channel_strips):
+    candidates = []
+
+    mseq_oid = entry.get("mseq_oid")
+    if mseq_oid in mseq_names and is_sane_name(mseq_names.get(mseq_oid)):
+        candidates.append(("mseq_link", mseq_names.get(mseq_oid)))
+
+    # In many projects Trak OID == MSeq OID; use this when explicit links are absent.
+    if oid in mseq_names and is_sane_name(mseq_names.get(oid)):
+        candidates.append(("mseq_self", mseq_names.get(oid)))
+
+    if oid in tx_texts and is_sane_name(tx_texts.get(oid)):
+        candidates.append(("tx_text", tx_texts.get(oid)))
+
+    cs_name = channel_strips.get(oid, {}).get("name")
+    if is_sane_name(cs_name):
+        candidates.append(("channel_strip", cs_name))
+
+    scored = []
+    base_priority = {
+        "mseq_link": 100,
+        "mseq_self": 95,
+        "tx_text": 70,
+        "channel_strip": 60
+    }
+    for source, name in candidates:
+        score = base_priority.get(source, 0)
+        if is_generic_track_name(name):
+            score -= 35
+        scored.append({
+            "source": source,
+            "name": name,
+            "score": score,
+            "generic": is_generic_track_name(name)
+        })
+
+    scored.sort(key=lambda x: (x["score"], x["source"]), reverse=True)
+
+    selected = None
+--
+        }
+
+    output_label = track.get("channel_strip", {}).get("output")
+    if isinstance(output_label, str) and output_label.strip():
+        lowered_output = output_label.lower().strip()
+        if lowered_output.startswith("bus "):
+            return {
+                "type": "summing",
+                "is_summing": True,
+                "source": "channel_output_bus",
+                "confidence": 0.55
+            }
+        if lowered_output.startswith("output ") or "stereo out" in lowered_output:
+            return {
+                "type": "none",
+                "is_summing": False,
+                "source": "channel_output_main",
+                "confidence": 0.5
+--
+            "track_hierarchy": [],
+            "top_level_stacks": [],
+            "channel_strips": [],
+            "plugins": [],
+            "midi_ports": [],
+            "environment_labels": [],
+            "environment_objects": [],
+            "environment_layout_map": [],
+            "environment_name_catalog": [],
+            "environment_y_decode_report": {},
+            "non_ascii_chunks": {},
+            "region_oid_reuse": {},
+            "region_alias_refinement": {},
+            "region_orphan_rec_assignment": {}
+        }
+    }
+
+    # 1. Parse Plist Metadata (if we have a .logicx base dir)
+--
