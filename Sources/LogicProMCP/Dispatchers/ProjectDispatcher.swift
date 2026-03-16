@@ -515,6 +515,16 @@ struct ProjectDispatcher {
             let stripNames = group["stripNames"] as? [String] ?? []
             log.append("  Group '\(groupName)': \(stripNames.joined(separator: ", "))")
 
+            // Clear ALL solos before starting this group (Ctrl+Option+Cmd+S)
+            let clearProc = Process()
+            clearProc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            clearProc.arguments = ["-e", "tell application \"System Events\" to keystroke \"s\" using {command down, option down, control down}"]
+            clearProc.standardOutput = FileHandle.nullDevice
+            clearProc.standardError = FileHandle.nullDevice
+            try? clearProc.run()
+            clearProc.waitUntilExit()
+            usleep(200_000) // 200ms for Logic to process
+
             var soloedNames: [String] = []
 
             if !stripNames.isEmpty {
@@ -548,27 +558,19 @@ struct ProjectDispatcher {
             let bounceResult = await router.route(operation: "project.bounce_section")
             log.append("    Bounce dialog: \(bounceResult.message)")
 
-            // Un-solo by name: select + osascript keystroke "s" to toggle off
-            for stripName in soloedNames {
-                let reselected = AccessibilityChannel.selectTrackByNameViaMenu(stripName)
-                if reselected {
-                    usleep(150_000) // 150 ms — let Logic register the selection
-                    let proc = Process()
-                    proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                    proc.arguments = ["-e", "tell application \"System Events\" to keystroke \"s\""]
-                    proc.standardOutput = FileHandle.nullDevice
-                    proc.standardError = FileHandle.nullDevice
-                    do {
-                        try proc.run()
-                        proc.waitUntilExit()
-                    } catch {
-                        log.append("    WARNING: unsolo osascript keystroke failed for '\(stripName)': \(error)")
-                    }
-                } else {
-                    log.append("    WARNING: could not re-select '\(stripName)' to unsolo")
-                }
-            }
+            // Solos will be cleared at the start of the next group iteration
+            // (or after the loop ends — add a final clear below)
         }
+
+        // Final clear all solos after last group
+        let finalClear = Process()
+        finalClear.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        finalClear.arguments = ["-e", "tell application \"System Events\" to keystroke \"s\" using {command down, option down, control down}"]
+        finalClear.standardOutput = FileHandle.nullDevice
+        finalClear.standardError = FileHandle.nullDevice
+        try? finalClear.run()
+        finalClear.waitUntilExit()
+        log.append("  All solos cleared")
 
         return CallTool.Result(content: [.text(log.joined(separator: "\n"))], isError: false)
     }
