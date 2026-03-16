@@ -74,8 +74,16 @@ enum ProjectDataParser {
         // Extract per-type maps
         let txSqMap = extractTxSqNames(chunks: chunks, data: data)       // oid -> name
         let evSqMarkerEvents = extractMarkerEvents(chunks: chunks, data: data) // [(oid, startTick, durationTicks)]
-        let tempoMap = extractTempoMap(chunks: chunks, data: data)
+        var tempoMap = extractTempoMap(chunks: chunks, data: data)
         let parsedTracks = extractTracks(chunks: chunks, data: data)
+
+        // If no tempo found at tick=0, try to get initial BPM from plists
+        if let lx = logicxURL, !tempoMap.contains(where: { $0.tick == 0 }) {
+            if let plistBPM = readBPMFromPlist(logicx: lx) {
+                let initial = TempoEntry(bpm: plistBPM, tick: 0, bar: 1)
+                tempoMap.insert(initial, at: 0)
+            }
+        }
 
         // Join marker names with positions
         let markers = buildMarkers(txSqMap: txSqMap, events: evSqMarkerEvents)
@@ -398,19 +406,24 @@ enum ProjectDataParser {
 
     // MARK: - Tempo Map Extraction
 
-    /// Extract tempo events from EvSq chunks.
-    ///
-    /// Tempo events follow the pattern:
-    ///   7F 00 00 01  [MM MM MM MM] [00 00 00 00] [PP PP PP PP PP PP PP PP]
-    /// where MM = millitempo (LE u32), PP = tick position (LE u64, but we read u32 for simplicity).
+    /// Extract tempo events from EvSq chunks using multiple strategies:
+    ///   1. Standard 7F 00 00 01 signature (existing method)
+    ///   2. Type-96 tempo bridge: row A [96, seq_tick, 0, 0x0100007F|0x8100007F],
+    ///      row B [tempo_raw, 0x88400000, tempo_tick_abs, 0]
     private static func extractTempoMap(chunks: [ChunkInfo], data: Data) -> [TempoEntry] {
         var entries: [TempoEntry] = []
 
         for chunk in chunks where chunk.id == idEvSq {
             guard chunk.bodyLength >= 20 else { continue }
             let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
-            let tempos = parseTempoEvents(body: body)
-            entries.append(contentsOf: tempos)
+
+            // Strategy 1: standard 7F 00 00 01 signature
+            let standardTempos = parseTempoEvents(body: body)
+            entries.append(contentsOf: standardTempos)
+
+            // Strategy 2: type-96 bridge (16-byte aligned pairs)
+            let bridgeTempos = parseType96TempoEvents(body: body)
+            entries.append(contentsOf: bridgeTempos)
         }
 
         // Sort by tick and deduplicate
@@ -452,6 +465,60 @@ enum ProjectDataParser {
             let bar = tick / ticksPerBar + 1
             entries.append(TempoEntry(bpm: bpm, tick: tick, bar: bar))
             offset += 20
+        }
+        return entries
+    }
+
+    /// Parse type-96 tempo bridge format from EvSq body.
+    ///
+    /// Format (16-byte aligned rows):
+    ///   row A: [u32=96, u32=sequence_tick, u32=0, u32=0x0100007F or 0x8100007F]
+    ///   row B: [u32=tempo_raw, u32=0x88400000, u32=tempo_tick_abs, u32=0]
+    ///   tempo_raw = BPM * 10000
+    private static func parseType96TempoEvents(body: Data) -> [TempoEntry] {
+        var entries: [TempoEntry] = []
+        let bytes = Data(body)
+        let count = bytes.count / 16
+        guard count >= 2 else { return entries }
+
+        var i = 0
+        while i + 1 < count {
+            let aOff = i * 16
+            let bOff = (i + 1) * 16
+
+            guard aOff + 16 <= bytes.count, bOff + 16 <= bytes.count else { break }
+
+            let a0 = readLE32(bytes, at: aOff + 0)   // should be 96
+            let a3 = readLE32(bytes, at: aOff + 12)  // should be 0x0100007F or 0x8100007F
+
+            // Row A signature check
+            guard a0 == 96,
+                  (a3 == 0x0100007F || a3 == 0x8100007F)
+            else {
+                i += 1
+                continue
+            }
+
+            let b0 = readLE32(bytes, at: bOff + 0)   // tempo_raw = BPM * 10000
+            let b1 = readLE32(bytes, at: bOff + 4)   // should be 0x88400000
+            let b2 = readLE32(bytes, at: bOff + 8)   // tempo_tick_abs
+            // b3 should be 0
+
+            guard b1 == 0x88400000, b0 > 0 else {
+                i += 1
+                continue
+            }
+
+            let bpm = Double(b0) / 10000.0
+            guard bpm > 10.0 && bpm < 1000.0 else {
+                i += 1
+                continue
+            }
+
+            let tick = Int(b2)
+            let bar = tick / ticksPerBar + 1
+            entries.append(TempoEntry(bpm: bpm, tick: tick, bar: bar))
+            i += 2  // consumed both rows
         }
         return entries
     }
@@ -506,42 +573,121 @@ enum ProjectDataParser {
             uniquingKeysWith: { first, _ in first }
         )
 
-        var markers: [ParsedMarker] = []
+        // First pass: build markers with tick/bar, sort by tick
+        struct PartialMarker {
+            let name: String
+            let bar: Int
+            let tick: Int
+            let oid: Int
+        }
 
+        var partials: [PartialMarker] = []
         for (oid, name) in txSqMap {
             guard let event = eventMap[oid] else { continue }
             let tick = Int(event.startTick)
             let bar = tick / ticksPerBar + 1
-            let durationTicks = Int(event.durationTicks)
+            partials.append(PartialMarker(name: name, bar: bar, tick: tick, oid: Int(oid)))
+        }
+
+        // Sort by tick position (ascending)
+        partials.sort { $0.tick < $1.tick }
+
+        // Second pass: calculate duration from sequential markers (Fix 1)
+        // For each marker except the last: duration = next_marker.tick - this_marker.tick
+        // For the last marker: default 8 bars = 3840 * 8 = 30720 ticks
+        let defaultLastDuration = ticksPerBar * 8
+
+        var markers: [ParsedMarker] = []
+        for (i, partial) in partials.enumerated() {
+            let durationTicks: Int
+            if i + 1 < partials.count {
+                durationTicks = partials[i + 1].tick - partial.tick
+            } else {
+                durationTicks = defaultLastDuration
+            }
             let durationBars = durationTicks > 0 ? max(1, durationTicks / ticksPerBar) : 0
 
             markers.append(ParsedMarker(
-                name: name,
-                bar: bar,
-                tick: tick,
+                name: partial.name,
+                bar: partial.bar,
+                tick: partial.tick,
                 durationTicks: durationTicks,
                 durationBars: durationBars,
-                oid: Int(oid)
+                oid: partial.oid
             ))
         }
 
-        // Sort by bar position
-        markers.sort { $0.bar < $1.bar }
         return markers
     }
 
-    // MARK: - Plist Parsing (Time Signature, Sample Rate)
+    // MARK: - Plist Parsing (Time Signature, Sample Rate, BPM)
+
+    /// Build a list of candidate plist URLs to check within a .logicx bundle.
+    /// The MetaData.plist is typically inside Alternatives/000/ (not at the root).
+    private static func plistCandidateURLs(logicx: URL, name: String) -> [URL] {
+        var candidates: [URL] = []
+        // Root-level (some older versions place files here)
+        candidates.append(logicx.appendingPathComponent(name))
+        // Alternatives subdirectories (000, 001, etc.)
+        let altRoot = logicx.appendingPathComponent("Alternatives")
+        let fm = FileManager.default
+        for index in 0...9 {
+            let indexStr = String(format: "%03d", index)
+            let url = altRoot.appendingPathComponent(indexStr).appendingPathComponent(name)
+            if fm.fileExists(atPath: url.path) {
+                candidates.insert(url, at: 0) // prefer found file
+            } else {
+                candidates.append(url)
+            }
+        }
+        return candidates
+    }
 
     /// Read time signature from MetaData.plist or ProjectInformation.plist.
     private static func readTimeSignature(logicx: URL) -> String? {
-        let candidates = [
-            logicx.appendingPathComponent("MetaData.plist"),
-            logicx.appendingPathComponent("ProjectInformation.plist"),
-        ]
-        for url in candidates {
-            guard let data = try? Data(contentsOf: url) else { continue }
-            guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) else { continue }
-            if let sig = searchPlistForTimeSignature(plist) { return sig }
+        let names = ["MetaData.plist", "ProjectInformation.plist"]
+        for name in names {
+            for url in plistCandidateURLs(logicx: logicx, name: name) {
+                guard let data = try? Data(contentsOf: url) else { continue }
+                guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) else { continue }
+                if let sig = searchPlistForTimeSignature(plist) { return sig }
+            }
+        }
+        return nil
+    }
+
+    /// Read initial BPM from project plists.
+    /// Checks MetaData.plist and ProjectInformation.plist for common BPM/Tempo keys.
+    private static func readBPMFromPlist(logicx: URL) -> Double? {
+        let names = ["MetaData.plist", "ProjectInformation.plist"]
+        for name in names {
+            for url in plistCandidateURLs(logicx: logicx, name: name) {
+                guard let data = try? Data(contentsOf: url) else { continue }
+                guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) else { continue }
+                if let bpm = searchPlistForBPM(plist) { return bpm }
+            }
+        }
+        return nil
+    }
+
+    private static func searchPlistForBPM(_ plist: Any) -> Double? {
+        let bpmKeys = ["BPM", "bpm", "Tempo", "tempo", "BeatsPerMinute", "beatsPerMinute",
+                       "ProjectTempo", "projectTempo", "DefaultTempo", "defaultTempo"]
+        if let dict = plist as? [String: Any] {
+            for key in bpmKeys {
+                if let v = dict[key] {
+                    if let d = v as? Double, d > 10.0 && d < 1000.0 { return d }
+                    if let i = v as? Int, i > 10 && i < 1000 { return Double(i) }
+                    if let s = v as? String, let d = Double(s), d > 10.0 && d < 1000.0 { return d }
+                }
+            }
+            for (_, value) in dict {
+                if let found = searchPlistForBPM(value) { return found }
+            }
+        } else if let arr = plist as? [Any] {
+            for item in arr {
+                if let found = searchPlistForBPM(item) { return found }
+            }
         }
         return nil
     }
@@ -567,25 +713,33 @@ enum ProjectDataParser {
 
     /// Read sample rate from project plists.
     private static func readSampleRate(logicx: URL) -> Int? {
-        let candidates = [
-            logicx.appendingPathComponent("MetaData.plist"),
-            logicx.appendingPathComponent("ProjectInformation.plist"),
-        ]
-        for url in candidates {
-            guard let data = try? Data(contentsOf: url) else { continue }
-            guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) else { continue }
-            if let sr = searchPlistForSampleRate(plist) { return sr }
+        // Check standard project plists (MetaData.plist is inside Alternatives/000/)
+        let names = ["MetaData.plist", "ProjectInformation.plist", "Info.plist"]
+        for name in names {
+            for url in plistCandidateURLs(logicx: logicx, name: name) {
+                guard let data = try? Data(contentsOf: url) else { continue }
+                guard let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) else { continue }
+                if let sr = searchPlistForSampleRate(plist) { return sr }
+            }
         }
         return nil
     }
 
     private static func searchPlistForSampleRate(_ plist: Any) -> Int? {
+        let srKeys = [
+            "SampleRate", "sampleRate", "sample_rate",
+            "Recording Sample Rate", "RecordingSampleRate",
+            "Audio Sample Rate", "AudioSampleRate",
+            "AudioFileSampleRate", "audioFileSampleRate",
+        ]
         if let dict = plist as? [String: Any] {
-            for key in ["SampleRate", "sampleRate", "sample_rate"] {
+            for key in srKeys {
                 if let v = dict[key] {
-                    if let i = v as? Int { return i }
-                    if let d = v as? Double { return Int(d) }
-                    if let s = v as? String, let i = Int(s) { return i }
+                    if let i = v as? Int, i > 0 { return i }
+                    if let d = v as? Double, d > 0 { return Int(d) }
+                    if let s = v as? String, let i = Int(s), i > 0 { return i }
+                    // Handle string-encoded floats (e.g. "44100.0")
+                    if let s = v as? String, let d = Double(s), d > 0 { return Int(d) }
                 }
             }
             for (_, value) in dict {
