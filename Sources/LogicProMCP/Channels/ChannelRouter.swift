@@ -24,7 +24,7 @@ actor ChannelRouter {
         "transport.set_tempo":        [.osc, .accessibility],
         "transport.get_state":        [.accessibility],
         "transport.goto_position":    [.coreMIDI, .cgEvent],
-        "transport.set_cycle_range":  [.accessibility],
+        "transport.set_cycle_range":  [.accessibility, .appleScript],
 
         // Track state reading
         "track.get_tracks":           [.accessibility],

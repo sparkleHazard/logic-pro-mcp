@@ -7,14 +7,16 @@
 
 Bidirectional, stateful control of Logic Pro from AI assistants. Combines **5 native macOS control channels** (CoreMIDI, Accessibility, CGEvent, AppleScript, OSC) into a single MCP server with smart routing, fallback chains, and sub-millisecond transport latency.
 
-**8 tools, 7 resources, ~3k context tokens.** Not 100+ individual tools.
+**8 tools, 9 resources, ~3k context tokens.** Not 100+ individual tools.
+
+Forked from [koltyj/logic-pro-mcp](https://github.com/koltyj/logic-pro-mcp) with significant enhancements — binary ProjectData parser, extended track hierarchy, function group inference, automated stem bounce planning, additional resources, and bug fixes for cycle range and track solo/select.
 
 ## How It Works
 
 ```
 Claude ──── 8 dispatcher tools ──── logic_transport("play", {})
          │                           logic_tracks("mute", {track: 3})
-         │  7 MCP resources ──────── logic://transport/state
+         │  9 MCP resources ──────── logic://transport/state
          │  (zero tool cost)         logic://tracks
          ▼
    ┌─── LogicProMCP ──────────────────────────────┐
@@ -27,68 +29,128 @@ Claude ──── 8 dispatcher tools ──── logic_transport("play", {})
 
 Each command routes through the fastest available channel, with automatic fallback if the primary fails.
 
-## Tools & Resources
+## Features
 
-### Tools (8 dispatchers — all actions)
+- **8 dispatcher tools** covering transport, tracks, mixer, MIDI, editing, navigation, project lifecycle, and system diagnostics
+- **9 MCP resources** serving live state as JSON at zero context cost
+- **5 native macOS channels**: CoreMIDI, Accessibility API, CGEvent keyboard injection, AppleScript, OSC
+- **Binary ProjectData parser** reads `.logicx` packages directly — no Logic running required
+- **Track hierarchy** with summing stack detection and nesting depth inference
+- **Function group inference** classifies tracks into groups (Guitars, Vocals, Drums, Keys/Synths, etc.)
+- **Automated stem bounce planning** — plans per-group stem bounces from marker boundaries
+- **Smart channel routing** with ordered fallback chains per operation
+- **Adaptive state cache** with configurable polling intervals (500ms active → 5s idle)
 
-| Tool | Commands | Examples |
-|------|----------|----------|
-| `logic_transport` | play, stop, record, set_tempo, goto_position... | `logic_transport("set_tempo", {tempo: 140})` |
-| `logic_tracks` | select, create_audio, mute, solo, arm, rename... | `logic_tracks("mute", {index: 2, enabled: true})` |
-| `logic_mixer` | set_volume, set_pan, insert_plugin, bypass_plugin... | `logic_mixer("set_volume", {track: 0, value: 0.8})` |
-| `logic_midi` | send_note, send_cc, send_chord, mmc_play... | `logic_midi("send_note", {note: 60, velocity: 100, channel: 1, duration_ms: 500})` |
-| `logic_edit` | undo, redo, cut, copy, paste, quantize, split... | `logic_edit("quantize", {value: "1/16"})` |
-| `logic_navigate` | goto_bar, create_marker, toggle_view, set_zoom... | `logic_navigate("toggle_view", {view: "mixer"})` |
-| `logic_project` | new, open, save, bounce, launch, quit | `logic_project("open", {path: "/path/to/song.logicx"})` |
-| `logic_system` | health, permissions, refresh_cache, help | `logic_system("help", {category: "transport"})` |
+## Binary Parser Capabilities
 
-### Resources (7 URIs — zero context cost)
+The `project.analyze` and `logic_project("analyze")` commands parse `.logicx` packages directly from disk:
+
+| Capability | Details |
+|------------|---------|
+| Arrangement markers | Names, bar positions, tick offsets, durations |
+| Tempo map | Initial BPM and all tempo changes with bar positions |
+| Track names | From MSeq chunks; all named and stack container tracks |
+| Time signature | From project plist (`4/4`, `3/4`, etc.) |
+| Sample rate | From project plist (44100, 48000, 96000, etc.) |
+| Audio file paths | All referenced audio files (AuFl chunks) |
+| Audio regions | Per-track regions with start bar, length, audio file OID (AuRg chunks) |
+| Track-to-region mapping | Links each region to its parent track |
+| Output routing | Per-track routing labels from AuCO chunks ("Bus 3", "Output 1-2") |
+| Volume / pan | Per-track normalized values from AuCO chunks |
+| Plugin detection | Plugin names from PluginData chunks |
+| Environment labels | Sub-track grouping labels from Envi chunks |
+| Function group inference | 12 groups inferred from track names and routing |
+| Channel strips | Full AuCO enumeration (449 strips vs 13 MSeq tracks in typical projects) |
+| Song lengths | Per-song lengths from reference track regions or marker boundaries |
+
+## Tools Reference
+
+| Tool | Commands | Description |
+|------|----------|-------------|
+| `logic_transport` | play, stop, record, pause, rewind, fast_forward, toggle_cycle, toggle_metronome, toggle_count_in, set_tempo, goto_position, set_cycle_range | Transport control and position |
+| `logic_tracks` | select, create_audio, create_instrument, create_drummer, create_external_midi, delete, duplicate, rename, mute, solo, arm, set_color | Track state and creation |
+| `logic_mixer` | set_volume, set_pan, set_send, set_output, set_input, set_master_volume, toggle_eq, reset_strip, insert_plugin, bypass_plugin | Mixer and plugin control |
+| `logic_midi` | send_note, send_chord, send_cc, send_program_change, send_pitch_bend, send_aftertouch, send_sysex, create_virtual_port, mmc_play, mmc_stop, mmc_record, mmc_locate | MIDI and MMC |
+| `logic_edit` | undo, redo, cut, copy, paste, delete, select_all, split, join, quantize, bounce_in_place, normalize, duplicate | Editing operations |
+| `logic_navigate` | goto_bar, goto_marker, create_marker, delete_marker, rename_marker, list_markers, zoom_to_fit, set_zoom, toggle_view | Navigation and markers |
+| `logic_project` | new, open, save, save_as, close, bounce, bounce_section, bounce_complete, tracks_hierarchy, bounce_stems, song_lengths, launch, quit, analyze | Project lifecycle and analysis |
+| `logic_system` | health, permissions, refresh_cache, help | Diagnostics and help |
+
+### Key Parameter Notes
+
+```
+logic_transport("set_tempo", {tempo: 140})
+logic_transport("goto_position", {bar: 17})
+logic_transport("set_cycle_range", {start: "5.1.1.1", end: "21.1.1.1"})
+
+logic_tracks("select", {index: 0})
+logic_tracks("solo", {index: 2, enabled: true})
+logic_tracks("rename", {index: 0, name: "Lead Vox"})
+
+logic_mixer("set_volume", {track: 0, value: 0.85})   // 0.0–1.0 normalized
+logic_mixer("set_pan", {track: 0, value: -0.5})       // -1.0 left … +1.0 right
+
+logic_midi("send_note", {note: 60, velocity: 100, channel: 1, duration_ms: 500})
+logic_midi("send_chord", {notes: [60,64,67], velocity: 90, channel: 1, duration_ms: 1000})
+
+logic_navigate("toggle_view", {view: "mixer"})
+logic_navigate("create_marker", {name: "Verse 1"})
+
+logic_project("analyze", {path: "/path/to/Song.logicx"})
+logic_project("bounce_stems", {marker_name: "Verse 1", groups: ["Guitars","Vocals"]})
+```
+
+## Resources Reference
 
 | URI | Description | Refresh |
 |-----|-------------|---------|
-| `logic://transport/state` | Playing/recording/tempo/position/cycle | 500ms |
-| `logic://tracks` | All tracks with mute/solo/arm states | 2s |
-| `logic://tracks/{index}` | Single track detail | 2s |
-| `logic://mixer` | All channel strips: volume, pan, plugins | 2s |
-| `logic://project/info` | Project name, sample rate, time sig | 5s |
-| `logic://midi/ports` | Available MIDI ports | 10s |
-| `logic://system/health` | Channel status, cache, permissions | on-demand |
+| `logic://transport/state` | Playing/recording/tempo/position/cycle state | 500ms |
+| `logic://tracks` | All tracks with mute/solo/arm/selected states | 2s |
+| `logic://tracks/{index}` | Single track detail by index | 2s |
+| `logic://tracks/live` | Full live track list with nesting depth | 2s |
+| `logic://mixer` | All channel strips: volume, pan | 2s |
+| `logic://project/info` | Project name, tempo, sample rate, time signature | 5s |
+| `logic://markers` | Arrangement markers (binary parser first, AX fallback) | on-demand |
+| `logic://midi/ports` | Available MIDI input/output ports | 10s |
+| `logic://system/health` | Channel status, cache snapshot, permissions | on-demand |
 
 ## Installation
-
-### Quick Install (Script)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/koltyj/logic-pro-mcp/main/Scripts/install.sh | bash
-```
-
-### Download Binary
-
-Grab the latest universal macOS binary from [GitHub Releases](https://github.com/koltyj/logic-pro-mcp/releases), then:
-
-```bash
-chmod +x LogicProMCP
-sudo mv LogicProMCP /usr/local/bin/
-```
 
 ### Build from Source
 
 Requires Swift 6.0+ and macOS 14+.
 
 ```bash
-git clone https://github.com/koltyj/logic-pro-mcp.git
+git clone https://github.com/alan1/logic-pro-mcp.git
 cd logic-pro-mcp
 swift build -c release
-# Binary at .build/release/LogicProMCP
+sudo cp .build/release/LogicProMCP /usr/local/bin/
 ```
 
 ### Register with Claude Code
 
 ```bash
-claude mcp add --scope user logic-pro -- LogicProMCP
+claude mcp add --scope user logic-pro -- /usr/local/bin/LogicProMCP
 ```
 
-### Claude Desktop (Manual Config)
+### Register with OpenCode
+
+Add to your OpenCode MCP config (`~/.config/opencode/config.json` or equivalent):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "logic-pro": {
+        "command": "/usr/local/bin/LogicProMCP",
+        "args": []
+      }
+    }
+  }
+}
+```
+
+### Register with OpenClaw / Claude Desktop
 
 Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
@@ -103,71 +165,114 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-## Permissions
+## Permissions Required
 
-The server requires two macOS permissions:
+The server requires two macOS permissions, and optionally a third:
 
-1. **Accessibility** — System Settings > Privacy & Security > Accessibility > add your terminal app
-2. **Automation** — System Settings > Privacy & Security > Automation > allow control of Logic Pro
+1. **Accessibility** — System Settings > Privacy & Security > Accessibility > add your terminal app (or the AI client app)
+2. **Automation (Logic Pro)** — System Settings > Privacy & Security > Automation > allow control of Logic Pro
+3. **Screen Recording** *(optional)* — needed if using peekaboo-based screenshot inspection of the Logic Pro UI
 
-Check permission status:
+Check permission status at any time:
 
 ```bash
 LogicProMCP --check-permissions
+# or via tool:
+# logic_system("permissions", {})
 ```
-
-## Usage
-
-Once registered, ask your AI assistant naturally:
-
-- *"What tracks do I have?"* — reads `logic://tracks` resource
-- *"Mute track 3"* — `logic_tracks("mute", {index: 3, enabled: true})`
-- *"Set tempo to 128"* — `logic_transport("set_tempo", {tempo: 128})`
-- *"Play a C major chord"* — `logic_midi("send_chord", {notes: [60,64,67], ...})`
-- *"Show me the mixer"* — `logic_navigate("toggle_view", {view: "mixer"})`
-
-For full command reference: `logic_system("help", {category: "all"})`
 
 ## Architecture
 
 ### Channel Routing
 
+Each operation is mapped to an ordered list of channels in `ChannelRouter.swift`. The router tries each channel in order and returns the first success. Channels are skipped when unhealthy (e.g. Logic Pro not running, AX not trusted).
+
 | Channel | Latency | Used For |
 |---------|---------|----------|
-| **CoreMIDI** | <1ms | Transport (MMC), note/CC/sysex sending |
-| **Accessibility** | ~15ms | State reading, UI button clicks, slider values |
-| **CGEvent** | <2ms | Keyboard shortcuts (postToPid, no focus needed) |
-| **AppleScript** | ~200ms | App lifecycle only (launch, quit, open file) |
-| **OSC** | <1ms | Mixer control (requires Logic Pro OSC setup) |
+| **CoreMIDI** | <1ms | Transport (MMC), note/CC/sysex/program change |
+| **CGEvent** | <2ms | Keyboard shortcuts (`postToPid` — no focus needed), track navigation |
+| **Accessibility** | ~15ms | State reads, UI clicks (mute/solo/arm buttons, tempo field, locators) |
+| **AppleScript** | ~200ms | App lifecycle (launch, quit, open/close project), cycle range fallback |
+| **OSC** | <1ms | Mixer continuous control (requires Logic Pro OSC control surface setup) |
+
+Example routing chains:
+
+```
+transport.play        → [CGEvent, CoreMIDI, AppleScript]
+transport.set_tempo   → [OSC, Accessibility]
+transport.set_cycle_range → [Accessibility, AppleScript]
+track.select          → [Accessibility, CGEvent]   // AX click header; fallback: Cmd+Up + Down×N
+track.set_solo        → [Accessibility, CGEvent]   // AX click button; fallback: select + S key
+midi.send_note        → [CoreMIDI]
+project.open          → [AppleScript]
+```
 
 ### State Cache
 
 Background Accessibility polling with adaptive intervals:
 
 - **Active** (tool used <5s ago): 500ms transport, 2s tracks/mixer
-- **Light** (5-30s idle): 2s all
+- **Light** (5–30s idle): 2s all
 - **Idle** (>30s): 5s all, near-zero CPU
+
+Resources trigger a direct AX read for freshness before serving cached data.
+
+### Binary Parser
+
+`ProjectDataParser.swift` walks the chunked binary format inside `ProjectData` files in a `.logicx` package. It does not require Logic Pro to be running. Chunk types parsed:
+
+- `MSeq` — track sequences (names, OIDs, hierarchy)
+- `AuCO` — channel strips (volume, pan, routing, names)
+- `AuRg` — audio regions (position, length, file OID)
+- `AuFl` — audio file references (paths)
+- `TxSq` — text sequences (marker names)
+- `EvSq` — event sequences (marker positions, tempo events)
+- `Trak` — arrangement track entries (OID linking)
+- `Envi` — environment objects (stack grouping labels)
 
 ### Context Efficiency
 
 | Approach | Tools | Resources | Context Cost |
-|----------|-------|-----------|-------------|
+|----------|-------|-----------|--------------|
 | Typical MCP server | 100+ tools | 0 | ~40k tokens |
-| **This server** | **8 tools** | **7 resources** | **~3k tokens** |
+| **This server** | **8 tools** | **9 resources** | **~3k tokens** |
 
-Same 100+ operations. 90% less context.
+Same 100+ operations. ~90% less context.
+
+## Differences from Upstream
+
+This fork ([koltyj/logic-pro-mcp](https://github.com/koltyj/logic-pro-mcp)) adds:
+
+| Feature | Status |
+|---------|--------|
+| Binary ProjectData parser (`ProjectDataParser.swift`) | Added |
+| `project.analyze` command | Added |
+| `project.tracks_hierarchy` command | Added |
+| `project.bounce_stems` command with group planning | Added |
+| `project.song_lengths` command | Added |
+| `logic://tracks/live` resource with nesting depth | Added |
+| `logic://markers` resource (binary-first) | Added |
+| `logic://tracks/{index}` parameterized resource | Added |
+| 9 resources (up from 7) | Added |
+| Function group inference (12 groups) | Added |
+| Channel strip enumeration (AuCO) | Added |
+| Environment label parsing (Envi) | Added |
+| Track-to-region mapping | Added |
+| Sub-track hierarchy with stack detection | Added |
+| `transport.set_cycle_range` — AX locator fields + AppleScript fallback | Fixed |
+| `track.select` — CGEvent fallback (Cmd+Up + Down×N) | Fixed |
+| `track.set_solo/mute/arm` — CGEvent fallback (select + S/M/R key) | Fixed |
 
 ## Limitations
 
-Logic Pro does not expose a programmatic API. This server works within macOS platform constraints:
+Logic Pro does not expose a programmatic API. This server operates within macOS platform constraints:
 
 - UI element paths may change between Logic Pro versions
-- Some deep state (automation curves, region MIDI data) is not exposed via Accessibility
+- Some deep state (automation curves, MIDI region data) is not accessible via Accessibility
 - AX element labels may be localized on non-English macOS
-- Plugin parameter control is limited to what's visible in the UI
-- OSC channel requires manual Logic Pro Control Surface setup
-
-This is the ceiling for Logic Pro automation given Apple's constraints.
+- Plugin parameter control is limited to what is visible in the UI
+- OSC channel requires manual Logic Pro Control Surface configuration
+- `set_cycle_range` requires Cycle mode to be enabled for AX locator fields to appear
 
 ## Development
 
@@ -177,11 +282,12 @@ swift build
 
 # Build release
 swift build -c release
+# Binary at .build/release/LogicProMCP
 
 # Run tests
 swift test
 
-# Check permissions without starting server
+# Check permissions
 .build/debug/LogicProMCP --check-permissions
 ```
 
@@ -192,12 +298,13 @@ Sources/LogicProMCP/
   main.swift                 # Entry point
   Server/                    # MCP server + config
   Dispatchers/               # 8 MCP tool dispatchers
-  Resources/                 # 7 MCP resource handlers
-  Channels/                  # 5 communication channels
-  Accessibility/             # AX API wrappers
+  Resources/                 # 9 MCP resource handlers
+  Channels/                  # 5 communication channels + router
+  Accessibility/             # AX API wrappers + Logic element finders
+  Binary/                    # ProjectData binary parser + models
   MIDI/                      # CoreMIDI engine + MMC
   OSC/                       # UDP client/server
-  State/                     # Cache + adaptive poller
+  State/                     # Cache + adaptive poller + state models
   Utilities/                 # Logging, permissions, process utils
 ```
 

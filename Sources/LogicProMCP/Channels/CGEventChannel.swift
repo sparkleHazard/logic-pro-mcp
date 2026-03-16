@@ -108,6 +108,20 @@ actor CGEventChannel: Channel {
             return .error("Logic Pro is not running")
         }
 
+        // Special multi-step operations that can't be handled by the flat keyMap
+        switch operation {
+        case "track.select":
+            return selectTrackByIndex(params: params, pid: pid)
+        case "track.set_mute":
+            return setTrackToggle(params: params, pid: pid, key: 46)   // M
+        case "track.set_solo":
+            return setTrackToggle(params: params, pid: pid, key: 1)    // S
+        case "track.set_arm":
+            return setTrackToggle(params: params, pid: pid, key: 15)   // R
+        default:
+            break
+        }
+
         guard let shortcut = Self.keyMap[operation] else {
             return .error("No keyboard shortcut mapped for: \(operation)")
         }
@@ -130,7 +144,64 @@ actor CGEventChannel: Channel {
         return .healthy(detail: "CGEvent ready")
     }
 
-    // MARK: - Event Posting
+    // MARK: - Track Selection & Toggle via Keyboard
+
+    /// Select a track by index using keyboard navigation.
+    ///
+    /// Logic Pro lets you navigate tracks with Up/Down arrow keys. This selects
+    /// the track at `index` by first pressing Cmd+Up (go to first track) and
+    /// then pressing Down `index` times.
+    ///
+    /// Key codes: Up=126, Down=125, Cmd+Up=first track (Logic shortcut).
+    private func selectTrackByIndex(params: [String: String], pid: pid_t) -> ChannelResult {
+        guard let indexStr = params["index"], let index = Int(indexStr), index >= 0 else {
+            return .error("Missing or invalid 'index' parameter for track.select")
+        }
+
+        // Cmd+Up navigates to the first (top) track in Logic Pro
+        _ = postKeyEvent(keyCode: 126, flags: .maskCommand, pid: pid)
+        // Small delay to allow Logic to process the navigation
+        Thread.sleep(forTimeInterval: 0.05)
+
+        // Press Down arrow `index` times to reach the desired track
+        for _ in 0..<index {
+            _ = postKeyEvent(keyCode: 125, flags: [], pid: pid)
+        }
+
+        return .success("{\"selected\":\(index),\"via\":\"cgEvent\"}")
+    }
+
+    /// Select a track by index and then toggle mute/solo/arm via the corresponding key.
+    ///
+    /// - Parameters:
+    ///   - key: Key code for M (mute=46), S (solo=1), or R (arm=15).
+    private func setTrackToggle(params: [String: String], pid: pid_t, key: CGKeyCode) -> ChannelResult {
+        guard let indexStr = params["index"], let index = Int(indexStr), index >= 0 else {
+            return .error("Missing or invalid 'index' parameter")
+        }
+
+        // First navigate to the track
+        let selectResult = selectTrackByIndex(params: params, pid: pid)
+        guard selectResult.isSuccess else { return selectResult }
+
+        // Brief pause so Logic registers the track selection before we toggle
+        Thread.sleep(forTimeInterval: 0.08)
+
+        // Press the toggle key
+        let toggled = postKeyEvent(keyCode: key, flags: [], pid: pid)
+        guard toggled else {
+            return .error("Failed to post toggle key \(key) to Logic Pro")
+        }
+
+        let keyName: String
+        switch key {
+        case 46: keyName = "Mute"
+        case 1:  keyName = "Solo"
+        case 15: keyName = "Arm"
+        default: keyName = "Key\(key)"
+        }
+        return .success("{\"track\":\(index),\"toggled\":\"\(keyName)\",\"via\":\"cgEvent\"}")
+    }
 
     /// Post a key-down/key-up pair to a specific PID.
     private func postKeyEvent(keyCode: CGKeyCode, flags: CGEventFlags, pid: pid_t) -> Bool {

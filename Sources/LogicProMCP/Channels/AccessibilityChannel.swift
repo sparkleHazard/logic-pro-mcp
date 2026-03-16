@@ -264,11 +264,75 @@ actor AccessibilityChannel: Channel {
     }
 
     private func setCycleRange(params: [String: String]) -> ChannelResult {
-        // Cycle range setting via AX is fragile — requires locating the cycle locators
-        guard let _ = params["start"], let _ = params["end"] else {
+        guard let startStr = params["start"], let endStr = params["end"] else {
             return .error("Missing 'start' and/or 'end' parameters")
         }
-        return .error("Cycle range setting not yet fully implemented via AX")
+
+        // Strategy 1: Find the cycle locator text fields in the transport bar via AX.
+        // When Cycle mode is enabled, Logic Pro exposes the left/right locator as
+        // editable fields. We look for them by description keywords.
+        if let transport = AXLogicProElements.getTransportBar() {
+            let allFields = AXHelpers.findAllDescendants(of: transport, role: kAXTextFieldRole, maxDepth: 5)
+            var leftField: AXUIElement? = nil
+            var rightField: AXUIElement? = nil
+
+            for field in allFields {
+                let desc = (AXHelpers.getDescription(field) ?? AXHelpers.getTitle(field) ?? "").lowercased()
+                if desc.contains("left") || desc.contains("locator") && leftField == nil {
+                    leftField = field
+                } else if desc.contains("right") || (desc.contains("locator") && leftField != nil) {
+                    rightField = field
+                }
+            }
+
+            // If we found at least one of the locator fields, try setting them
+            if leftField != nil || rightField != nil {
+                if let lf = leftField {
+                    AXHelpers.setAttribute(lf, kAXValueAttribute, startStr as CFTypeRef)
+                    AXHelpers.performAction(lf, kAXConfirmAction)
+                }
+                if let rf = rightField {
+                    AXHelpers.setAttribute(rf, kAXValueAttribute, endStr as CFTypeRef)
+                    AXHelpers.performAction(rf, kAXConfirmAction)
+                }
+                let set = [leftField != nil ? "left locator → \(startStr)" : nil,
+                           rightField != nil ? "right locator → \(endStr)" : nil]
+                    .compactMap { $0 }.joined(separator: ", ")
+                return .success("{\"cycle_range_set\":\"\(set)\"}")
+            }
+        }
+
+        // Strategy 2: AppleScript via System Events — use key-value coding on Logic's
+        // cycle range properties. Logic Pro supports getting/setting locators via
+        // AppleScript but the property name varies by version.
+        let escapedStart = startStr.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedEnd = endStr.replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application "Logic Pro"
+            set left locator to "\(escapedStart)"
+            set right locator to "\(escapedEnd)"
+        end tell
+        """
+        var errorDict: NSDictionary?
+        let appleScript = NSAppleScript(source: script)
+        _ = appleScript?.executeAndReturnError(&errorDict)
+
+        if errorDict == nil {
+            return .success("{\"cycle_range\":{\"start\":\"\(escapedStart)\",\"end\":\"\(escapedEnd)\"},\"via\":\"AppleScript\"}")
+        }
+
+        // Strategy 3: Use System Events key navigation to set cycle start/end.
+        // This is the keyboard approach: user must have cycle enabled.
+        // We cannot reliably type into locator fields without knowing their screen position.
+        // Return an informative error so users know the state of support.
+        let asError = (errorDict?[NSAppleScript.errorMessage] as? String) ?? "unknown"
+        return .error(
+            "Cannot set cycle range automatically. " +
+            "AX: locator fields not found in transport bar (cycle may be disabled). " +
+            "AppleScript: \(asError). " +
+            "To set the cycle range manually: enable Cycle (C), then drag the cycle region in the ruler, " +
+            "or use Logic's Set Locators dialog (Option+click on cycle region)."
+        )
     }
 
     // MARK: - Tracks
