@@ -6,13 +6,15 @@ struct ProjectDispatcher {
         name: "logic_project",
         description: """
             Project lifecycle in Logic Pro. \
-            Commands: new, open, save, save_as, close, bounce, bounce_section, launch, quit, analyze. \
+            Commands: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, launch, quit, analyze. \
             Params by command: \
             open -> { path: String }; \
             save_as -> { path: String }; \
             bounce -> {} (opens bounce dialog); \
             bounce_section -> { marker_name: String } or { start_bar: Int, end_bar: Int } \
             (sets cycle range to section boundaries, enables cycle, opens bounce dialog); \
+            bounce_complete -> { destination: String?, click_bounce: Bool? } \
+            (best-effort AX automation of the open bounce dialog: set path, click Bounce); \
             analyze -> { path: String? } (parse ProjectData binary; defaults to current project); \
             launch/quit -> {} (app lifecycle); \
             Others -> {}
@@ -85,6 +87,9 @@ struct ProjectDispatcher {
         case "analyze":
             return analyzeProject(params: params)
 
+        case "bounce_complete":
+            return await bounceComplete(params: params, axChannel: axChannel)
+
         case "launch":
             if ProcessUtils.isLogicProRunning {
                 return CallTool.Result(content: [.text("Logic Pro is already running")], isError: false)
@@ -119,7 +124,7 @@ struct ProjectDispatcher {
 
         default:
             return CallTool.Result(
-                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, analyze, launch, quit")],
+                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, analyze, launch, quit")],
                 isError: true
             )
         }
@@ -259,6 +264,41 @@ struct ProjectDispatcher {
             content: [.text(summary)],
             isError: !bounceResult.isSuccess
         )
+    }
+
+    // MARK: - bounce_complete
+
+    /// Best-effort automation of the bounce dialog opened by bounce_section.
+    ///
+    /// Uses the Accessibility API to:
+    ///   1. Locate the bounce dialog window in Logic Pro.
+    ///   2. Optionally set output format controls (WAV 48 kHz 24-bit) via AX.
+    ///   3. Optionally set the destination path via an AX text field.
+    ///   4. Click the "Bounce" button.
+    ///
+    /// This is best-effort — the exact AX element structure may change between Logic versions.
+    /// If the dialog cannot be found, an error is returned suggesting manual completion.
+    ///
+    /// Params:
+    ///   - destination: Optional output file path to set in the dialog.
+    ///   - click_bounce: Bool (default true) — whether to click the Bounce button.
+    private static func bounceComplete(
+        params: [String: Value],
+        axChannel: AccessibilityChannel?
+    ) async -> CallTool.Result {
+        guard let ax = axChannel else {
+            return CallTool.Result(
+                content: [.text("bounce_complete requires AX channel (axChannel unavailable)")],
+                isError: true
+            )
+        }
+
+        let destination = params["destination"]?.stringValue
+        let shouldClick = params["click_bounce"]?.boolValue ?? true
+
+        // Delegate to the AccessibilityChannel actor
+        let result = await ax.completeBounceDialog(destination: destination, clickBounce: shouldClick)
+        return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
     }
 
     /// Parse a bar number from a "Bar.Beat.Division.Tick" or plain integer string.

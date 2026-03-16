@@ -419,17 +419,107 @@ actor AccessibilityChannel: Channel {
     // MARK: - JSON encoding
 
     private func encodeResult<T: Encodable>(_ value: T) -> ChannelResult {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
         do {
-            let data = try encoder.encode(value)
-            guard let json = String(data: data, encoding: .utf8) else {
-                return .error("Failed to encode result to UTF-8")
-            }
-            return .success(json)
+            let data = try JSONEncoder().encode(value)
+            let str = String(data: data, encoding: .utf8) ?? "{}"
+            return .success(str)
         } catch {
             return .error("JSON encoding failed: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Bounce Dialog Automation
+
+    /// Best-effort automation of the Logic Pro bounce dialog.
+    ///
+    /// NOTE: This is version-sensitive and may break between Logic updates.
+    ///
+    /// Steps attempted:
+    ///   1. Find a window whose title contains "Bounce" in the Logic Pro AX tree.
+    ///   2. If `destination` is provided, locate a text field and set its value.
+    ///   3. If `clickBounce` is true, find and press the "Bounce" button.
+    ///
+    /// Returns a ChannelResult describing what was done (or why it failed).
+    func completeBounceDialog(destination: String?, clickBounce: Bool) -> ChannelResult {
+        guard AXIsProcessTrusted() else {
+            return .error("Accessibility not trusted — cannot automate bounce dialog")
+        }
+        guard ProcessUtils.isLogicProRunning else {
+            return .error("Logic Pro is not running")
+        }
+
+        // Find the bounce dialog window
+        guard let appRoot = AXLogicProElements.appRoot() else {
+            return .error("Cannot access Logic Pro AX element")
+        }
+
+        // Walk windows looking for one whose title contains "Bounce"
+        let windows: [AXUIElement] = AXHelpers.getAttribute(appRoot, kAXWindowsAttribute) ?? []
+        var bounceWindow: AXUIElement? = nil
+        for window in windows {
+            let title = AXHelpers.getTitle(window) ?? ""
+            if title.lowercased().contains("bounce") {
+                bounceWindow = window
+                break
+            }
+        }
+
+        // Also try sheets / dialogs attached to the main window
+        if bounceWindow == nil {
+            if let mainWin = AXLogicProElements.mainWindow() {
+                let sheet = AXHelpers.findDescendant(of: mainWin, role: "AXSheet", maxDepth: 3)
+                    ?? AXHelpers.findDescendant(of: mainWin, role: kAXWindowRole, maxDepth: 3)
+                if let s = sheet {
+                    let title = AXHelpers.getTitle(s) ?? ""
+                    if title.lowercased().contains("bounce") || title.isEmpty {
+                        bounceWindow = s
+                    }
+                }
+            }
+        }
+
+        guard let dialog = bounceWindow else {
+            return .error(
+                "Bounce dialog not found. Use bounce_section first to open it, " +
+                "then call bounce_complete. If the dialog is open but this fails, " +
+                "complete the bounce manually — AX dialog detection may differ in this Logic version."
+            )
+        }
+
+        var steps: [String] = []
+
+        // Set destination path if provided
+        if let dest = destination, !dest.isEmpty {
+            // Look for a text field — typical label is "Destination" or similar
+            let textFields = AXHelpers.findAllDescendants(of: dialog, role: kAXTextFieldRole, maxDepth: 6)
+            if let field = textFields.first {
+                AXHelpers.setAttribute(field, kAXValueAttribute, dest as CFTypeRef)
+                AXHelpers.performAction(field, kAXConfirmAction)
+                steps.append("set destination to '\(dest)'")
+            } else {
+                steps.append("WARNING: could not find destination text field")
+            }
+        }
+
+        // Click the Bounce button
+        if clickBounce {
+            // Search for a button titled "Bounce" or "OK" inside the dialog
+            let buttons = AXHelpers.findAllDescendants(of: dialog, role: kAXButtonRole, maxDepth: 6)
+            let bounceBtn = buttons.first(where: {
+                let t = AXHelpers.getTitle($0)?.lowercased() ?? ""
+                return t == "bounce" || t == "ok" || t == "export"
+            })
+            if let btn = bounceBtn {
+                let btnTitle = AXHelpers.getTitle(btn) ?? "?"
+                AXHelpers.performAction(btn, kAXPressAction)
+                steps.append("clicked '\(btnTitle)' button")
+            } else {
+                steps.append("WARNING: could not find Bounce/OK button — complete manually")
+            }
+        }
+
+        let summary = steps.isEmpty ? "Bounce dialog found but no actions taken" : steps.joined(separator: "; ")
+        return .success("bounce_complete: \(summary)")
     }
 }
 
