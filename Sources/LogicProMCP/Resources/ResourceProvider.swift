@@ -18,6 +18,12 @@ struct ResourceProvider {
             mimeType: "application/json"
         ),
         Resource(
+            name: "Live Tracks",
+            uri: "logic://tracks/live",
+            description: "Full live track list read directly from the AX arrange window: name, type, mute/solo/arm, nesting depth for hierarchy inference. Supplements binary-parser results.",
+            mimeType: "application/json"
+        ),
+        Resource(
             name: "Mixer",
             uri: "logic://mixer",
             description: "All channel strips: volume, pan, plugins, sends",

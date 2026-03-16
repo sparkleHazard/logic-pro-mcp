@@ -9,7 +9,10 @@ struct ProjectDataInfo: Sendable, Codable {
     /// Tempo map entries (may have multiple for tempo changes).
     var tempoMap: [TempoEntry] = []
     /// Track names extracted from MSeq chunks, enriched with optional mixer data.
+    /// Includes all named tracks plus stack container tracks (even "Untitled" ones with children).
     var tracks: [ParsedTrack] = []
+    /// All MSeq tracks including internal/automation tracks. For debugging and hierarchy building.
+    var allTracks: [ParsedTrack] = []
     /// Audio regions parsed from AuRg chunks.
     var regions: [ParsedRegion] = []
     /// Audio file references parsed from AuFl chunks.
@@ -56,7 +59,8 @@ struct TempoEntry: Sendable, Codable {
 
 // MARK: - Tracks
 
-/// A track name parsed from an MSeq chunk, optionally enriched with mixer data.
+/// A track name parsed from an MSeq chunk, optionally enriched with mixer data,
+/// hierarchy information, and function group classification.
 struct ParsedTrack: Sendable, Codable {
     /// Track name (ASCII).
     var name: String
@@ -70,6 +74,25 @@ struct ParsedTrack: Sendable, Codable {
     var pan: Double?
     /// Regions assigned to this track (populated by track-to-region mapping pass).
     var regions: [ParsedRegion] = []
+
+    // MARK: Hierarchy fields
+
+    /// OID of this track's parent stack (nil = top-level track).
+    var parentOid: Int?
+    /// OIDs of direct child tracks in this stack.
+    var childOids: [Int] = []
+    /// Depth in the track hierarchy (0 = root level, 1 = direct child of stack, etc.).
+    var stackDepth: Int = 0
+    /// Stack classification: "summing", "folder", or nil for regular tracks.
+    var stackType: String?
+    /// True when this track is a summing stack (routes to a bus and has children).
+    var isSummingStack: Bool = false
+
+    // MARK: Function group fields
+
+    /// Inferred function group label (e.g. "Guitars", "Vocals", "Drums").
+    /// Nil for tracks that could not be classified.
+    var functionGroup: String?
 }
 
 // MARK: - Regions

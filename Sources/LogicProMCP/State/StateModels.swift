@@ -40,6 +40,31 @@ struct TrackState: Sendable, Codable, Identifiable {
     var color: String?
     /// Output routing label (e.g. "Stereo Out", "Bus 1"). Populated via AX inspection.
     var outputRouting: String?
+    /// Nesting depth in the arrange window (0 = top-level). Populated by AX live discovery.
+    var nestingDepth: Int = 0
+}
+
+/// A live track record read directly from the AX tree of the arrange window.
+/// Richer than TrackState — includes nesting depth for hierarchy inference.
+struct LiveTrackInfo: Sendable, Codable {
+    /// 0-based display index in the arrange window.
+    var index: Int
+    /// Track name as shown in the arrange window header.
+    var name: String
+    /// Track type inferred from AX roles/descriptions.
+    var type: TrackType = .unknown
+    /// True when the mute button is active.
+    var isMuted: Bool = false
+    /// True when the solo button is active.
+    var isSoloed: Bool = false
+    /// True when the record-arm button is active.
+    var isArmed: Bool = false
+    /// True when this track is selected in the arrange window.
+    var isSelected: Bool = false
+    /// Nesting depth in the track stack hierarchy (0 = root level, 1 = child, etc.).
+    var nestingDepth: Int = 0
+    /// Output routing label if readable from AX.
+    var outputRouting: String?
 }
 
 /// Mixer channel strip state (extends track with routing info).

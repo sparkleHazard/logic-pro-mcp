@@ -6,7 +6,8 @@ struct ProjectDispatcher {
         name: "logic_project",
         description: """
             Project lifecycle in Logic Pro. \
-            Commands: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, launch, quit, analyze. \
+            Commands: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, \
+            tracks_hierarchy, bounce_stems, launch, quit, analyze. \
             Params by command: \
             open -> { path: String }; \
             save_as -> { path: String }; \
@@ -15,6 +16,9 @@ struct ProjectDispatcher {
             (sets cycle range to section boundaries, enables cycle, opens bounce dialog); \
             bounce_complete -> { destination: String?, click_bounce: Bool? } \
             (best-effort AX automation of the open bounce dialog: set path, click Bounce); \
+            tracks_hierarchy -> { path: String? } (full track tree with stacks and function groups); \
+            bounce_stems -> { path: String?, marker_name: String?, start_bar: Int?, end_bar: Int?, \
+            groups: [String]?, execute: Bool? } (plan or execute per-group stem bounces); \
             analyze -> { path: String? } (parse ProjectData binary; defaults to current project); \
             launch/quit -> {} (app lifecycle); \
             Others -> {}
@@ -87,6 +91,12 @@ struct ProjectDispatcher {
         case "analyze":
             return analyzeProject(params: params)
 
+        case "tracks_hierarchy":
+            return tracksHierarchy(params: params)
+
+        case "bounce_stems":
+            return await bounceStems(params: params, router: router, cache: cache, axChannel: axChannel)
+
         case "bounce_complete":
             return await bounceComplete(params: params, axChannel: axChannel)
 
@@ -124,10 +134,248 @@ struct ProjectDispatcher {
 
         default:
             return CallTool.Result(
-                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, analyze, launch, quit")],
+                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, tracks_hierarchy, bounce_stems, analyze, launch, quit")],
                 isError: true
             )
         }
+    }
+
+    // MARK: - tracks_hierarchy
+
+    /// Return the full track tree with stacks, children, and function groups.
+    private static func tracksHierarchy(params: [String: Value]) -> CallTool.Result {
+        let path: String?
+        if let explicit = params["path"]?.stringValue, !explicit.isEmpty {
+            path = explicit
+        } else {
+            path = currentLogicProProjectPath()
+        }
+
+        guard let projectPath = path else {
+            return CallTool.Result(
+                content: [.text("tracks_hierarchy: could not determine project path. Pass 'path' param or ensure Logic Pro is open.")],
+                isError: true
+            )
+        }
+
+        guard let info = ProjectDataParser.parse(path: projectPath) else {
+            return CallTool.Result(
+                content: [.text("tracks_hierarchy: failed to parse ProjectData at '\(projectPath)'.")],
+                isError: true
+            )
+        }
+
+        // Build OID -> track map for the public tracks array
+        let tracks = info.tracks
+        let oidToTrack: [Int: ParsedTrack] = Dictionary(uniqueKeysWithValues: tracks.map { ($0.oid, $0) })
+
+        // Encode a track node (without full regions list to keep output concise)
+        func encodeNode(_ t: ParsedTrack) -> [String: Any] {
+            var node: [String: Any] = [
+                "name": t.name,
+                "oid": t.oid,
+                "stackDepth": t.stackDepth,
+                "isSummingStack": t.isSummingStack,
+            ]
+            if let fg = t.functionGroup { node["functionGroup"] = fg }
+            if let st = t.stackType { node["stackType"] = st }
+            if let parent = t.parentOid { node["parentOid"] = parent }
+            if !t.childOids.isEmpty {
+                let children = t.childOids.compactMap { oidToTrack[$0] }.map { encodeNode($0) }
+                node["children"] = children
+            }
+            return node
+        }
+
+        // Separate stack roots (has children, no parent in public set) from ungrouped
+        let publicOids = Set(tracks.map { $0.oid })
+        let stacks = tracks.filter { t in
+            !t.childOids.isEmpty && (t.parentOid == nil || !publicOids.contains(t.parentOid!))
+        }.map { encodeNode($0) }
+
+        let ungrouped = tracks.filter { t in
+            t.childOids.isEmpty && (t.parentOid == nil || !publicOids.contains(t.parentOid!))
+        }.map { t -> [String: Any] in
+            var node: [String: Any] = ["name": t.name, "oid": t.oid]
+            if let fg = t.functionGroup { node["functionGroup"] = fg }
+            return node
+        }
+
+        let result: [String: Any] = [
+            "project": info.projectName,
+            "trackCount": tracks.count,
+            "stacks": stacks,
+            "ungrouped": ungrouped,
+        ]
+
+        guard let jsonData = try? JSONSerialization.data(
+            withJSONObject: result,
+            options: [.prettyPrinted, .sortedKeys]
+        ), let json = String(data: jsonData, encoding: .utf8) else {
+            return CallTool.Result(content: [.text("tracks_hierarchy: JSON encoding failed")], isError: true)
+        }
+
+        return CallTool.Result(content: [.text(json)], isError: false)
+    }
+
+    // MARK: - bounce_stems
+
+    /// Plan (or execute) per-function-group stem bounces for a song section.
+    ///
+    /// Params:
+    ///   - path: .logicx path (optional, auto-detected if omitted)
+    ///   - marker_name / start_bar + end_bar: section to bounce
+    ///   - groups: array of function group names to include (nil = all)
+    ///   - execute: Bool (default false) — when true, solo + bounce each group
+    private static func bounceStems(
+        params: [String: Value],
+        router: ChannelRouter,
+        cache: StateCache,
+        axChannel: AccessibilityChannel?
+    ) async -> CallTool.Result {
+        let path: String?
+        if let explicit = params["path"]?.stringValue, !explicit.isEmpty {
+            path = explicit
+        } else {
+            path = currentLogicProProjectPath()
+        }
+
+        guard let projectPath = path else {
+            return CallTool.Result(
+                content: [.text("bounce_stems: could not determine project path.")],
+                isError: true
+            )
+        }
+
+        guard let info = ProjectDataParser.parse(path: projectPath) else {
+            return CallTool.Result(
+                content: [.text("bounce_stems: failed to parse ProjectData at '\(projectPath)'.")],
+                isError: true
+            )
+        }
+
+        // --- Resolve section bars ---
+        var startBar: Int
+        var endBar: Int
+
+        if let markerName = params["marker_name"]?.stringValue {
+            let sorted = info.markers.sorted { $0.bar < $1.bar }
+            guard let target = sorted.first(where: { $0.name.localizedCaseInsensitiveContains(markerName) }) else {
+                return CallTool.Result(
+                    content: [.text("bounce_stems: no marker matching '\(markerName)'.")],
+                    isError: true
+                )
+            }
+            startBar = target.bar
+            if let next = sorted.first(where: { $0.bar > startBar }) {
+                endBar = next.bar
+            } else {
+                endBar = startBar + target.durationBars
+            }
+        } else if let sb = params["start_bar"]?.intValue, let eb = params["end_bar"]?.intValue {
+            startBar = sb; endBar = eb
+        } else {
+            // Default: full project (bar 1 to last marker end)
+            startBar = 1
+            endBar = (info.markers.map { $0.bar + $0.durationBars }.max() ?? 9) + 1
+        }
+
+        // --- Build function group → tracks mapping ---
+        let requestedGroups: Set<String>?
+        if let gArr = params["groups"],
+           case let Value.array(gVals) = gArr {
+            requestedGroups = Set(gVals.compactMap { $0.stringValue })
+        } else {
+            requestedGroups = nil
+        }
+
+        // Group tracks by function group (leaf tracks only — those with regions)
+        var groupMap: [String: [ParsedTrack]] = [:]
+        for track in info.tracks {
+            guard let group = track.functionGroup else { continue }
+            if let requested = requestedGroups, !requested.contains(group) { continue }
+            groupMap[group, default: []].append(track)
+        }
+
+        // Sort groups deterministically
+        let groups = groupMap.keys.sorted().map { groupName -> [String: Any] in
+            let members = groupMap[groupName]!
+            return [
+                "name": groupName,
+                "trackOids": members.map { $0.oid },
+                "trackNames": members.map { $0.name },
+            ]
+        }
+
+        let plan: [String: Any] = [
+            "song": info.projectName,
+            "bars": [startBar, endBar],
+            "groups": groups,
+        ]
+
+        let execute = params["execute"]?.boolValue ?? false
+        guard execute else {
+            // Return plan only
+            guard let jsonData = try? JSONSerialization.data(
+                withJSONObject: plan,
+                options: [.prettyPrinted, .sortedKeys]
+            ), let json = String(data: jsonData, encoding: .utf8) else {
+                return CallTool.Result(content: [.text("bounce_stems: JSON encoding failed")], isError: true)
+            }
+            return CallTool.Result(content: [.text(json)], isError: false)
+        }
+
+        // --- Execute: for each group, solo those tracks → set cycle → bounce → unsolo ---
+        var log: [String] = ["bounce_stems executing for bars \(startBar)–\(endBar):"]
+
+        // Set cycle range first
+        let cycleResult = await router.route(
+            operation: "transport.set_cycle_range",
+            params: ["start": "\(startBar).1.1.1", "end": "\(endBar).1.1.1"]
+        )
+        if !cycleResult.isSuccess {
+            log.append("  WARNING: set cycle range failed: \(cycleResult.message)")
+        } else {
+            log.append("  Cycle set to bars \(startBar)–\(endBar)")
+        }
+        _ = await router.route(operation: "transport.toggle_cycle")
+
+        for group in groups {
+            guard let groupName = group["name"] as? String,
+                  let oids = group["trackOids"] as? [Int],
+                  let names = group["trackNames"] as? [String] else { continue }
+
+            log.append("  Group '\(groupName)': \(names.joined(separator: ", "))")
+
+            // Solo tracks by index (best-effort — AX index may differ from binary OID)
+            // We use the track index in the public tracks array
+            var soloedIndices: [Int] = []
+            for (trackIdx, track) in info.tracks.enumerated() where oids.contains(track.oid) {
+                let soloResult = await router.route(
+                    operation: "track.set_solo",
+                    params: ["index": "\(trackIdx)", "enabled": "true"]
+                )
+                if soloResult.isSuccess {
+                    soloedIndices.append(trackIdx)
+                } else {
+                    log.append("    WARNING: solo track \(trackIdx) (\(track.name)) failed: \(soloResult.message)")
+                }
+            }
+
+            // Open bounce dialog
+            let bounceResult = await router.route(operation: "project.bounce_section")
+            log.append("    Bounce dialog: \(bounceResult.message)")
+
+            // Un-solo
+            for idx in soloedIndices {
+                _ = await router.route(
+                    operation: "track.set_solo",
+                    params: ["index": "\(idx)", "enabled": "false"]
+                )
+            }
+        }
+
+        return CallTool.Result(content: [.text(log.joined(separator: "\n"))], isError: false)
     }
 
     // MARK: - analyze

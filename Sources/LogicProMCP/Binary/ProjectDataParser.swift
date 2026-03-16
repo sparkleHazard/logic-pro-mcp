@@ -82,7 +82,9 @@ enum ProjectDataParser {
         let txSqMap = extractTxSqNames(chunks: chunks, data: data)       // oid -> name
         let evSqMarkerEvents = extractMarkerEvents(chunks: chunks, data: data) // [(oid, startTick, durationTicks)]
         var tempoMap = extractTempoMap(chunks: chunks, data: data)
-        var parsedTracks = extractTracks(chunks: chunks, data: data)
+        let (publicTracks, allTracks) = extractTracks(chunks: chunks, data: data)
+        var parsedTracks = publicTracks
+        var allParsedTracks = allTracks
 
         // If no tempo found at tick=0, try to get initial BPM from plists
         if let lx = logicxURL, !tempoMap.contains(where: { $0.tick == 0 }) {
@@ -105,16 +107,28 @@ enum ProjectDataParser {
         // Extract audio regions
         var regions = extractRegions(chunks: chunks, data: data)
 
-        // Apply track-to-region mapping
+        // Apply track-to-region mapping (uses public tracks for OID set)
         applyTrackRegionMapping(
             chunks: chunks,
             data: data,
             tracks: &parsedTracks,
             regions: &regions
         )
+        // Also apply mapping to allTracks (so hierarchy containers get region info)
+        applyTrackRegionMapping(
+            chunks: chunks,
+            data: data,
+            tracks: &allParsedTracks,
+            regions: &regions
+        )
 
         // Enrich tracks with AuCO mixer data (volume, pan, output routing)
         enrichTracksWithAuCO(chunks: chunks, data: data, tracks: &parsedTracks)
+        enrichTracksWithAuCO(chunks: chunks, data: data, tracks: &allParsedTracks)
+
+        // Infer function groups for public tracks, then propagate to children
+        inferFunctionGroups(tracks: &parsedTracks)
+        inferFunctionGroups(tracks: &allParsedTracks)
 
         // Extract plugin list
         let plugins = extractPlugins(chunks: chunks, data: data)
@@ -123,6 +137,7 @@ enum ProjectDataParser {
         info.markers = markers
         info.tempoMap = tempoMap
         info.tracks = parsedTracks
+        info.allTracks = allParsedTracks
         info.regions = regions
         info.audioFiles = audioFiles
         info.plugins = plugins
@@ -555,40 +570,133 @@ enum ProjectDataParser {
 
     // MARK: - Track Name Extraction (MSeq)
 
-    /// Extract track names from MSeq chunks.
+    /// Raw record returned from MSeq parsing before filtering / hierarchy building.
+    private struct RawMSeqTrack {
+        let oid: UInt32
+        let name: String        // may be empty / generic
+        let parentOid: UInt32   // 0 = no parent
+    }
+
+    /// Extract ALL MSeq tracks including internal ones.
     ///
     /// MSeq body layout:
+    ///   0x08  4B  parent OID (LE u32) — 0 means no parent
     ///   0x10  2B  name_length (LE u16)
     ///   0x12  *B  name (ASCII)
-    private static func extractTracks(chunks: [ChunkInfo], data: Data) -> [ParsedTrack] {
-        var result: [ParsedTrack] = []
+    private static func extractAllMSeqTracks(chunks: [ChunkInfo], data: Data) -> [RawMSeqTrack] {
+        var result: [RawMSeqTrack] = []
         var seen = Set<UInt32>()
 
         for chunk in chunks where chunk.id == idMSeq {
             guard chunk.bodyLength > 0x12 else { continue }
             let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
-
             guard body.count > 0x12 else { continue }
+
+            // Parent OID at 0x08
+            let parentOid = body.count >= 0x0C ? readLE32(body, at: 0x08) : 0
+
+            // Name
             let nameLen = Int(readLE16(body, at: 0x10))
-            guard nameLen > 0, 0x12 + nameLen <= body.count else { continue }
-
-            guard let name = String(data: body[0x12..<(0x12 + nameLen)], encoding: .utf8)
+            var name = ""
+            if nameLen > 0, 0x12 + nameLen <= body.count {
+                name = (String(data: body[0x12..<(0x12 + nameLen)], encoding: .utf8)
                     ?? String(data: body[0x12..<(0x12 + nameLen)], encoding: .isoLatin1)
-            else { continue }
-
-            let cleaned = name.trimmingCharacters(in: .controlCharacters.union(.whitespacesAndNewlines))
-            guard !cleaned.isEmpty else { continue }
-            // Filter out generic/internal tracks
-            guard !cleaned.hasPrefix("*Automation"),
-                  cleaned != "Untitled",
-                  !cleaned.hasPrefix("Track Automation")
-            else { continue }
+                    ?? "")
+                    .trimmingCharacters(in: .controlCharacters.union(.whitespacesAndNewlines))
+            }
 
             if seen.insert(chunk.oid).inserted {
-                result.append(ParsedTrack(name: cleaned, oid: Int(chunk.oid)))
+                result.append(RawMSeqTrack(oid: chunk.oid, name: name, parentOid: parentOid))
             }
         }
         return result
+    }
+
+    /// Build ParsedTrack array from raw MSeq records.
+    /// Returns (publicTracks, allTracks) where:
+    ///   - allTracks: every MSeq entry
+    ///   - publicTracks: non-automation named tracks PLUS any track with children (stack containers)
+    private static func extractTracks(chunks: [ChunkInfo], data: Data) -> (public: [ParsedTrack], all: [ParsedTrack]) {
+        let raw = extractAllMSeqTracks(chunks: chunks, data: data)
+        guard !raw.isEmpty else { return ([], []) }
+
+        // Build OID -> index map
+        var oidToIndex: [UInt32: Int] = [:]
+        for (i, r) in raw.enumerated() {
+            oidToIndex[r.oid] = i
+        }
+
+        // Build hierarchy: parentOid -> [childOids]
+        var childrenOf: [UInt32: [UInt32]] = [:]
+        for r in raw {
+            guard r.parentOid != 0, r.parentOid != r.oid else { continue }
+            // Validate parent exists
+            guard oidToIndex[r.parentOid] != nil else { continue }
+            childrenOf[r.parentOid, default: []].append(r.oid)
+        }
+
+        // Compute stack depth via BFS from roots
+        var depth: [UInt32: Int] = [:]
+        var queue: [(oid: UInt32, d: Int)] = []
+        for r in raw {
+            let hasValidParent = r.parentOid != 0 && oidToIndex[r.parentOid] != nil
+            if !hasValidParent {
+                depth[r.oid] = 0
+                queue.append((r.oid, 0))
+            }
+        }
+        var qi = 0
+        while qi < queue.count {
+            let (oid, d) = queue[qi]; qi += 1
+            for child in childrenOf[oid] ?? [] {
+                depth[child] = d + 1
+                queue.append((child, d + 1))
+            }
+        }
+
+        // Classify stack type based on name keywords + output routing
+        func classifyStack(name: String, outputRouting: String?) -> (type: String?, isSumming: Bool) {
+            let lower = name.lowercased()
+            if lower.contains("summing") && lower.contains("stack") {
+                return ("summing", true)
+            }
+            if lower.contains("folder stack") || lower.contains("track automation root folder") {
+                return ("folder", false)
+            }
+            if let out = outputRouting?.lowercased() {
+                if out.hasPrefix("bus ") { return ("summing", true) }
+                if out.hasPrefix("output ") || out.contains("stereo out") { return (nil, false) }
+            }
+            // Has children → treat as stack
+            return (nil, false)
+        }
+
+        // Build ParsedTrack array (all)
+        let allTracks: [ParsedTrack] = raw.map { r in
+            let children = (childrenOf[r.oid] ?? []).map { Int($0) }.sorted()
+            let d = depth[r.oid] ?? 0
+            let hasParent = r.parentOid != 0 && oidToIndex[r.parentOid] != nil
+            let (sType, isSumming) = classifyStack(name: r.name, outputRouting: nil)
+            var track = ParsedTrack(name: r.name.isEmpty ? "Untitled" : r.name, oid: Int(r.oid))
+            track.parentOid = hasParent ? Int(r.parentOid) : nil
+            track.childOids = children
+            track.stackDepth = d
+            track.stackType = children.isEmpty ? sType : (sType ?? (children.isEmpty ? nil : "summing"))
+            track.isSummingStack = isSumming || (!children.isEmpty && (sType == "summing"))
+            return track
+        }
+
+        // Public filter: named non-automation tracks + any track with children (stack containers)
+        let publicTracks = allTracks.filter { track in
+            let hasChildren = !track.childOids.isEmpty
+            let isAutomation = track.name.hasPrefix("*Automation") || track.name.hasPrefix("Track Automation")
+            let isUntitled = track.name == "Untitled"
+            if isAutomation { return false }
+            if isUntitled { return hasChildren }
+            return true
+        }
+
+        return (publicTracks, allTracks)
     }
 
     // MARK: - Audio File References (AuFl)
@@ -1123,6 +1231,93 @@ enum ProjectDataParser {
     /// Returns true if the chunk ID consists only of non-printable / null bytes.
     private static func isNullID(_ id: String) -> Bool {
         return id.unicodeScalars.allSatisfy { $0.value < 32 || $0.value == 0 }
+    }
+
+    // MARK: - Function Group Inference
+
+    /// Infer a function group label for each track based on keywords in the track name and region names.
+    /// Children inherit their parent's function group when they have none of their own.
+    static func inferFunctionGroups(tracks: inout [ParsedTrack]) {
+        // Build OID -> index map for fast lookup
+        var oidToIdx: [Int: Int] = [:]
+        for (i, t) in tracks.enumerated() {
+            oidToIdx[t.oid] = i
+        }
+
+        // First pass: assign from track name + region names
+        for i in tracks.indices {
+            let group = inferGroupFromText(tracks[i].name)
+                ?? inferGroupFromRegions(tracks[i].regions)
+            tracks[i].functionGroup = group
+        }
+
+        // Second pass: children inherit parent group when unclassified
+        // Process from shallowest to deepest
+        let sorted = tracks.indices.sorted { tracks[$0].stackDepth < tracks[$1].stackDepth }
+        for i in sorted {
+            guard tracks[i].functionGroup == nil else { continue }
+            if let parentOid = tracks[i].parentOid,
+               let parentIdx = oidToIdx[parentOid],
+               let parentGroup = tracks[parentIdx].functionGroup {
+                tracks[i].functionGroup = parentGroup
+            }
+        }
+    }
+
+    /// Infer function group from a single text string (track name, region name, etc.)
+    private static func inferGroupFromText(_ text: String) -> String? {
+        let lower = text.lowercased()
+        guard !lower.isEmpty else { return nil }
+
+        // Ordered from most specific to least specific
+        if lower.contains("click") || lower.contains("cue") || lower.contains("metronome")
+            || lower.contains("klopfgeist") {
+            return "Click Track"
+        }
+        if lower.contains("drum") || lower.contains("kick") || lower.contains("snare")
+            || lower.contains("hi-hat") || lower.contains("hihat") || lower.contains("cymbal")
+            || lower.contains("tom") {
+            return "Drums"
+        }
+        if lower.contains("guitar") || lower.contains("gtr") || lower.contains("guit") {
+            return "Guitars"
+        }
+        if lower.contains("vocal") || lower.contains("vox") || lower.contains("bv")
+            || lower.contains("backing vocal") || lower.contains("harmony") {
+            return "Vocals"
+        }
+        if lower.contains("key") || lower.contains("piano") || lower.contains("organ")
+            || lower.contains("synth") || lower.contains("pad") {
+            return "Keys/Synths"
+        }
+        if lower.contains("bass") {
+            return "Bass"
+        }
+        if lower.contains("sample") || lower.contains("sfx") || lower.contains("ambient")
+            || lower.contains("soundscape") {
+            return "Samples/FX"
+        }
+        if lower.contains("midi") || lower.contains("trigger") || lower.contains("cortex")
+            || lower.contains("controller") {
+            return "MIDI Triggers"
+        }
+        if lower.contains("reference") || lower.contains("mix") || lower.contains("master") {
+            return "Reference"
+        }
+        if lower.contains("backing") {
+            return "Backing Track"
+        }
+        return nil
+    }
+
+    /// Infer function group from region names on a track.
+    private static func inferGroupFromRegions(_ regions: [ParsedRegion]) -> String? {
+        for region in regions.prefix(10) {
+            if let g = inferGroupFromText(region.name) {
+                return g
+            }
+        }
+        return nil
     }
 
     // MARK: - Marker Assembly

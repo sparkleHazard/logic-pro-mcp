@@ -1,0 +1,663 @@
+
+    aliases = track.get("name_aliases")
+    if isinstance(aliases, list):
+        for alias in aliases:
+            candidate = clean_track_label_candidate(alias)
+            if candidate:
+                promoted_name = candidate
+                promoted_source = {
+                    "source": "alias_promoted",
+                    "name": candidate,
+                    "score": 55,
+                    "generic": False
+                }
+                break
+
+    if not promoted_name:
+        inferred_name, inferred_source = infer_track_name_from_regions(track, region_lookup)
+        if inferred_name:
+            promoted_name = inferred_name
+            promoted_source = inferred_source
+
+            existing_aliases = track.get("name_aliases", [])
+            if not isinstance(existing_aliases, list):
+                existing_aliases = []
+            lowered_existing = {str(a).lower() for a in existing_aliases if isinstance(a, str)}
+            if inferred_name.lower() not in lowered_existing:
+                existing_aliases.insert(0, inferred_name)
+            track["name_aliases"] = existing_aliases
+
+    if not promoted_name:
+        return
+
+    track["name"] = promoted_name
+    norm, _ = normalize_tokens(promoted_name)
+    if norm:
+        track["name_norm"] = norm
+
+    if promoted_source:
+        sources = track.get("name_sources", [])
+        if not isinstance(sources, list):
+            sources = []
+        duplicate = False
+        for source_entry in sources:
+            if not isinstance(source_entry, dict):
+                continue
+            if source_entry.get("source") == promoted_source.get("source") and source_entry.get("name") == promoted_source.get("name"):
+                duplicate = True
+                break
+        if not duplicate:
+            sources.append(promoted_source)
+        track["name_sources"] = sources
+
+def resolve_track_display_name(track):
+    if not isinstance(track, dict):
+        return "Track"
+
+    primary = track.get("name")
+    if isinstance(primary, str) and primary.strip() and not is_generic_track_name(primary):
+        return primary.strip()
+
+    aliases = track.get("name_aliases")
+    if isinstance(aliases, list):
+        for alias in aliases:
+            candidate = clean_track_label_candidate(alias)
+            if candidate:
+                return candidate
+
+    return f"Track {track.get('oid')}"
+
+def refresh_track_runtime_fields(track, region_lookup):
+    if not isinstance(track, dict):
+        return
+    promote_track_name(track, region_lookup)
+    track["display_name"] = resolve_track_display_name(track)
+    track["name_is_generic"] = is_generic_track_name(track.get("name")) if track.get("name") else True
+    stack_meta = classify_track_stack(track)
+    track["track_stack"] = stack_meta
+    track["is_summing_track_stack"] = stack_meta.get("is_summing")
+    track["track_id"] = build_track_id(
+        track.get("oid"),
+        uuid=track.get("uuid"),
+        mseq_oid=track.get("mseq_oid"),
+        name=track.get("name") or track.get("display_name")
+    )
+
+def classify_track_stack(track):
+    if not isinstance(track, dict):
+        return {
+            "type": "unknown",
+            "is_summing": False,
+            "source": "invalid_track",
+            "confidence": 0.0
+        }
+
+    labels = []
+    for key in ("name", "name_raw", "display_name"):
+        value = track.get(key)
+        if isinstance(value, str) and value.strip():
+            labels.append(value.strip())
+    aliases = track.get("name_aliases")
+    if isinstance(aliases, list):
+        for alias in aliases:
+            if isinstance(alias, str) and alias.strip():
+                labels.append(alias.strip())
+
+    lowered_labels = " ".join(labels).lower()
+    if "summing" in lowered_labels and "stack" in lowered_labels:
+        return {
+            "type": "summing",
+            "is_summing": True,
+            "source": "name_keyword",
+            "confidence": 0.95
+        }
+    if "folder stack" in lowered_labels or "track automation root folder" in lowered_labels:
+        return {
+            "type": "folder",
+            "is_summing": False,
+            "source": "name_keyword",
+            "confidence": 0.9
+        }
+
+    output_label = track.get("channel_strip", {}).get("output")
+    if isinstance(output_label, str) and output_label.strip():
+        lowered_output = output_label.lower().strip()
+        if lowered_output.startswith("bus "):
+            return {
+                "type": "summing",
+                "is_summing": True,
+                "source": "channel_output_bus",
+                "confidence": 0.55
+            }
+        if lowered_output.startswith("output ") or "stereo out" in lowered_output:
+            return {
+                "type": "none",
+                "is_summing": False,
+                "source": "channel_output_main",
+                "confidence": 0.5
+            }
+
+    if isinstance(track.get("flags_raw"), int):
+        return {
+            "type": "unknown",
+            "is_summing": False,
+            "source": "trak_flags_raw",
+            "confidence": 0.2
+        }
+
+    return {
+        "type": "unknown",
+        "is_summing": False,
+        "source": "insufficient_data",
+        "confidence": 0.0
+    }
+
+def build_track_hierarchy(final_tracks, mseq_parent_refs):
+    hierarchy_edges = []
+    if not isinstance(final_tracks, dict) or not final_tracks:
+        return hierarchy_edges
+
+    track_by_oid = final_tracks
+    track_keys = {}
+    key_to_tracks = {}
+
+    for oid, track in track_by_oid.items():
+        keys = set()
+        if isinstance(oid, int):
+            keys.add(oid)
+        mseq_oid = track.get("mseq_oid")
+        if isinstance(mseq_oid, int):
+            keys.add(mseq_oid)
+        track_keys[oid] = keys
+        for key in keys:
+            key_to_tracks.setdefault(key, set()).add(oid)
+
+    candidates = {}
+
+    def add_candidate(child_oid, parent_oid, confidence, source):
+        if child_oid == parent_oid:
+            return
+        if child_oid not in track_by_oid or parent_oid not in track_by_oid:
+            return
+        key = (child_oid, parent_oid)
+        existing = candidates.get(key)
+        if existing is None or confidence > existing.get("confidence", 0.0):
+            candidates[key] = {
+                "child_oid": child_oid,
+                "parent_oid": parent_oid,
+                "confidence": round(float(confidence), 2),
+                "source": source
+            }
+
+    # Heuristic 1: Shared MSeq key membership. Prefer non-generic anchor as parent.
+    for key, members in key_to_tracks.items():
+        if len(members) < 2:
+            continue
+        member_list = [track_by_oid[m] for m in members if m in track_by_oid]
+        if len(member_list) < 2:
+            continue
+
+        def anchor_sort(track):
+            stack_type = track.get("track_stack", {}).get("type")
+            stack_bonus = 0
+            if stack_type in ("summing", "folder"):
+                stack_bonus = 1
+            return (
+                0 if not track.get("name_is_generic", False) else 1,
+                -stack_bonus,
+                -(len(track.get("regions", []))),
+                track.get("oid", 0)
+            )
+
+        anchor = sorted(member_list, key=anchor_sort)[0]
+        anchor_oid = anchor.get("oid")
+        if anchor_oid is None:
+            continue
+
+        for member in member_list:
+            child_oid = member.get("oid")
+            if child_oid is None or child_oid == anchor_oid:
+                continue
+            conf = 0.85 if member.get("name_is_generic", False) else 0.55
+            add_candidate(child_oid, anchor_oid, conf, "shared_mseq_key")
+
+    # Heuristic 2: Explicit MSeq ref at offset 0x08 from MSeq bodies.
+    if isinstance(mseq_parent_refs, dict):
+        for child_oid, keys in track_keys.items():
+            child_track = track_by_oid.get(child_oid, {})
+            child_generic = child_track.get("name_is_generic", False)
+            for key in keys:
+                parent_key = mseq_parent_refs.get(key)
+                if parent_key is None:
+                    continue
+                parent_oids = key_to_tracks.get(parent_key, set())
+                for parent_oid in parent_oids:
+                    if parent_oid == child_oid:
+                        continue
+                    parent_track = track_by_oid.get(parent_oid, {})
+                    parent_generic = parent_track.get("name_is_generic", False)
+                    conf = 0.35
+                    if child_generic and not parent_generic:
+                        conf = 0.8
+                    elif child_generic and parent_generic:
+                        conf = 0.45
+                    elif (not child_generic) and (not parent_generic):
+                        conf = 0.4
+                    if parent_track.get("track_stack", {}).get("type") in ("summing", "folder"):
+                        conf += 0.1
+                    add_candidate(child_oid, parent_oid, conf, "mseq_ref_off8")
+
+    parent_of = {}
+
+    def creates_cycle(child_oid, parent_oid):
+        seen = {child_oid}
+        current = parent_oid
+        while current is not None:
+            if current in seen:
+                return True
+            seen.add(current)
+            current = parent_of.get(current)
+        return False
+
+    by_child = {}
+    for edge in candidates.values():
+        by_child.setdefault(edge["child_oid"], []).append(edge)
+
+    for child_oid, options in by_child.items():
+        ranked = sorted(
+            options,
+            key=lambda e: (
+                -e.get("confidence", 0.0),
+                -len(track_by_oid.get(e.get("parent_oid"), {}).get("regions", [])),
+                e.get("parent_oid", 0)
+            )
+        )
+        selected = None
+        for edge in ranked:
+            if edge.get("confidence", 0.0) < 0.5:
+                continue
+            parent_oid = edge.get("parent_oid")
+            if parent_oid is None:
+                continue
+            if creates_cycle(child_oid, parent_oid):
+                continue
+            selected = edge
+            break
+        if selected:
+            parent_of[child_oid] = selected["parent_oid"]
+
+    children_of = {}
+    for child_oid, parent_oid in parent_of.items():
+        children_of.setdefault(parent_oid, set()).add(child_oid)
+
+    def resolve_root(start_oid):
+        current = start_oid
+        seen = {start_oid}
+        depth = 0
+        while current in parent_of:
+            nxt = parent_of.get(current)
+            if nxt is None or nxt in seen:
+                break
+            seen.add(nxt)
+            current = nxt
+            depth += 1
+            if depth > 128:
+                break
+        return current, depth
+
+    for oid, track in track_by_oid.items():
+        parent_oid = parent_of.get(oid)
+        if parent_oid is not None:
+            track["parent_track_oid"] = parent_oid
+        root_oid, depth = resolve_root(oid)
+        track["stack_root_track_oid"] = root_oid
+        track["stack_depth"] = depth
+        track["stack_child_oids"] = sorted(list(children_of.get(oid, set())))
+        root_track = track_by_oid.get(root_oid)
+        if isinstance(root_track, dict):
+            root_name = root_track.get("display_name") or root_track.get("name")
+            if isinstance(root_name, str) and root_name.strip():
+                track["stack_root_name"] = root_name
+        track["in_track_stack"] = depth > 0 or len(track.get("stack_child_oids", [])) > 0
+
+    for child_oid, parent_oid in parent_of.items():
+        child_track = track_by_oid.get(child_oid, {})
+        parent_track = track_by_oid.get(parent_oid, {})
+        source = "inferred"
+        confidence = 0.5
+        for edge in by_child.get(child_oid, []):
+            if edge.get("parent_oid") == parent_oid:
+                source = edge.get("source", source)
+                confidence = edge.get("confidence", confidence)
+                break
+        hierarchy_edges.append({
+            "parent_track_oid": parent_oid,
+            "parent_track_name": parent_track.get("display_name") or parent_track.get("name"),
+            "child_track_oid": child_oid,
+            "child_track_name": child_track.get("display_name") or child_track.get("name"),
+            "source": source,
+            "confidence": round(float(confidence), 2)
+        })
+
+    hierarchy_edges.sort(key=lambda e: (e.get("parent_track_oid", 0), e.get("child_track_oid", 0)))
+    return hierarchy_edges
+
+def infer_canonical_stack_name(text):
+    if not isinstance(text, str):
+        return None
+    lowered = text.lower().strip()
+    if not lowered:
+        return None
+
+    if "midi triggers" in lowered or "midi trigger" in lowered:
+        return "Midi Triggers"
+    if "click track" in lowered or lowered == "click" or "midi click" in lowered:
+        return "Click Track"
+    if "backing track" in lowered:
+        return "Backing Track"
+    if "release track" in lowered:
+        return "Release Track"
+
+    if "cortex midi" in lowered and "quad cortex" in lowered:
+        return "Midi Triggers"
+    if "nano cortex midi" in lowered:
+        return "Midi Triggers"
+    if "intro track" in lowered:
+        return "Release Track"
+    if "live effects" in lowered or "riser" in lowered:
+        return "Release Track"
+    if "transition" in lowered:
+        return "Release Track"
+    if "backing" in lowered and ("fx" in lowered or "instrumental" in lowered):
+        return "Backing Track"
+    return None
+
+def infer_track_top_level_stack(track, region_lookup):
+    if not isinstance(track, dict):
+        return None
+
+    fragments = []
+    for key in ("display_name", "name", "name_raw", "stack_root_name"):
+        value = track.get(key)
+        if isinstance(value, str) and value.strip():
+            fragments.append(value.strip())
+    aliases = track.get("name_aliases")
+    if isinstance(aliases, list):
+        for alias in aliases:
+            if isinstance(alias, str) and alias.strip():
+                fragments.append(alias.strip())
+    for ref in track.get("regions", [])[:120]:
+        region_oid = ref.get("oid") if isinstance(ref, dict) else ref
+        region = region_lookup.get(region_oid) if isinstance(region_lookup, dict) else None
+        if not isinstance(region, dict):
+            continue
+        for key in ("name", "file"):
+            value = region.get(key)
+            if isinstance(value, str) and value.strip():
+                fragments.append(value.strip())
+
+    # Strong explicit signal from names/aliases.
+    explicit_hits = []
+    for fragment in fragments:
+    if "backing" in lowered and ("fx" in lowered or "instrumental" in lowered):
+        return "Backing Track"
+    return None
+
+def infer_track_top_level_stack(track, region_lookup):
+    if not isinstance(track, dict):
+        return None
+
+    fragments = []
+    for key in ("display_name", "name", "name_raw", "stack_root_name"):
+        value = track.get(key)
+        if isinstance(value, str) and value.strip():
+            fragments.append(value.strip())
+    aliases = track.get("name_aliases")
+    if isinstance(aliases, list):
+        for alias in aliases:
+            if isinstance(alias, str) and alias.strip():
+                fragments.append(alias.strip())
+    for ref in track.get("regions", [])[:120]:
+        region_oid = ref.get("oid") if isinstance(ref, dict) else ref
+        region = region_lookup.get(region_oid) if isinstance(region_lookup, dict) else None
+        if not isinstance(region, dict):
+            continue
+        for key in ("name", "file"):
+            value = region.get(key)
+            if isinstance(value, str) and value.strip():
+                fragments.append(value.strip())
+
+    # Strong explicit signal from names/aliases.
+    explicit_hits = []
+    for fragment in fragments:
+        canonical = infer_canonical_stack_name(fragment)
+        if canonical:
+            explicit_hits.append(canonical)
+    if explicit_hits:
+        distinct = sorted(set(explicit_hits))
+        if len(distinct) == 1:
+            return {
+                "name": distinct[0],
+                "confidence": 0.95,
+                "source": "explicit_name",
+                "evidence": distinct[0]
+            }
+
+        display_lower = str(track.get("display_name") or track.get("name") or "").lower()
+        if "midi" in display_lower:
+            chosen = "Midi Triggers"
+        elif "click" in display_lower:
+            chosen = "Click Track"
+        elif "backing" in display_lower:
+            chosen = "Backing Track"
+        elif any(token in display_lower for token in ("release", "riser", "fx", "transition")):
+            chosen = "Release Track"
+        elif "Backing Track" in distinct:
+            chosen = "Backing Track"
+        elif "Midi Triggers" in distinct:
+            chosen = "Midi Triggers"
+        elif "Click Track" in distinct:
+            chosen = "Click Track"
+        else:
+            chosen = distinct[0]
+        return {
+            "name": chosen,
+            "confidence": 0.78,
+            "source": "explicit_name_ambiguous",
+            "evidence": ",".join(distinct)
+        }
+
+    joined = " | ".join(fragments).lower()
+    scores = {
+        "Midi Triggers": 0.0,
+        "Click Track": 0.0,
+        "Backing Track": 0.0,
+        "Release Track": 0.0
+    }
+
+    weights = {
+        "Midi Triggers": [
+            ("midi triggers", 10.0), ("midi trigger", 9.0), ("quad cortex midi", 8.0),
+            ("nano cortex midi", 8.0), ("cortex midi", 6.0), ("trigger", 4.0), ("midi", 2.0)
+        ],
+        "Click Track": [
+            ("click track", 10.0), ("midi click", 8.0), ("click", 3.0), ("metronome", 6.0)
+        ],
+        "Backing Track": [
+            ("backing track", 10.0), ("backing", 5.0), ("instrumental", 6.0),
+            ("synth", 4.0), ("choir", 4.0), ("stem", 1.0), ("bip", 3.0)
+        ],
+        "Release Track": [
+            ("release track", 10.0), ("release", 8.0), ("live effects", 8.0),
+            ("riser", 8.0), ("fx", 6.0), ("transition", 5.0),
+            ("outro", 4.0), ("intro track", 4.0), ("impact", 5.0)
+        ]
+    }
+
+    for stack_name, patterns in weights.items():
+        for pattern, weight in patterns:
+            if pattern in joined:
+                scores[stack_name] += weight
+
+    if scores["Midi Triggers"] > 0 and "click track" in joined and "trigger" not in joined and "cortex midi" not in joined:
+        scores["Midi Triggers"] -= 2.5
+    if scores["Click Track"] > 0 and "backing track" in joined and "click track" not in joined:
+        scores["Click Track"] -= 1.5
+    if scores["Release Track"] > 0 and "click track" in joined and "release" not in joined:
+        scores["Release Track"] -= 2.0
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_name, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+    if best_score < 6.0:
+        return None
+    if best_score < (second_score + 1.5):
+        return None
+
+    confidence = min(0.9, 0.55 + (best_score / 20.0))
+    return {
+        "name": best_name,
+        "confidence": round(confidence, 2),
+        "source": "keyword_scoring",
+        "evidence": f"{best_name}:{round(best_score, 2)}"
+    }
+
+def assign_named_top_level_stacks(final_tracks, region_lookup, environment_labels, environment_layout_map):
+    if not isinstance(final_tracks, dict):
+        return []
+
+    release_title_hints = build_release_title_hints(environment_layout_map, environment_labels)
+
+    discovered = set()
+    for raw in environment_labels or []:
+        canonical = infer_canonical_stack_name(raw)
+        if canonical:
+            discovered.add(canonical)
+    if isinstance(environment_layout_map, dict):
+        for payload in environment_layout_map.values():
+            if not isinstance(payload, dict):
+                continue
+            canonical = infer_canonical_stack_name(payload.get("name"))
+            if canonical:
+                discovered.add(canonical)
+
+    stack_members = {
+        "Midi Triggers": set(),
+        "Click Track": set(),
+        "Backing Track": set(),
+        "Release Track": set()
+    }
+
+    for oid, track in final_tracks.items():
+        info = infer_track_top_level_stack(track, region_lookup)
+        if not info:
+            region_count = len(track.get("regions", []))
+            display_lower = str(track.get("display_name") or track.get("name") or "").lower()
+            if "midi" in display_lower or "trigger" in display_lower:
+                info = {"name": "Midi Triggers", "confidence": 0.45, "source": "fallback_display"}
+            elif "click" in display_lower:
+                info = {"name": "Click Track", "confidence": 0.45, "source": "fallback_display"}
+            elif any(token in display_lower for token in ("release", "riser", "fx", "transition", "intro track")):
+                info = {"name": "Release Track", "confidence": 0.4, "source": "fallback_display"}
+            elif any(token in display_lower for token in ("drum", "backing", "synth", "choir", "guitar", "texture", "harmony", "comp", "rec")):
+                info = {"name": "Backing Track", "confidence": 0.33, "source": "fallback_display"}
+            elif region_count > 0:
+                info = {"name": "Backing Track", "confidence": 0.35, "source": "fallback_default"}
+            else:
+                continue
+
+        # Override with stronger primary-name hints to stabilize release/backing classification.
+        primary_label = track.get("display_name") or track.get("name") or track.get("name_raw") or ""
+        primary_norm, primary_tokens = normalize_tokens(primary_label)
+        primary_has_backing = bool(primary_tokens.intersection(BACKING_FUNCTION_TOKENS))
+        primary_is_release_title = bool(primary_norm and primary_norm in release_title_hints)
+        if primary_has_backing:
+            info = {
+                "name": "Backing Track",
+                "confidence": 0.88,
+                "source": "primary_name_hint",
+                "evidence": primary_label
+            }
+        elif primary_is_release_title:
+            info = {
+                "name": "Release Track",
+                "confidence": 0.88,
+                "source": "primary_name_hint",
+                "evidence": primary_label
+            }
+
+        stack_name = info.get("name")
+        if stack_name not in stack_members:
+            continue
+        track["top_level_stack_name"] = stack_name
+        track["top_level_stack_confidence"] = info.get("confidence")
+        track["top_level_stack_source"] = info.get("source")
+        track["top_level_stack_evidence"] = info.get("evidence")
+        stack_members[stack_name].add(oid)
+        discovered.add(stack_name)
+
+    ordered = ["Midi Triggers", "Click Track", "Backing Track", "Release Track"]
+    output = []
+    for stack_name in ordered:
+        members = sorted(list(stack_members.get(stack_name, set())))
+        b'Compressor', b'Channel EQ', b'Gain', b'Limiter', b'Kontakt', b'Serum',
+        b'FabFilter', b'Omnisphere', b'Valhalla', b'Echo', b'Reverb'
+    ]
+
+    audio_files = {}
+    mseq_names = {}
+    mseq_parent_refs = {}
+    trak_entries = {}
+    channel_strips = {}
+    tx_texts = {}
+    aurg_chunks = []
+    song_bodies = []
+    usel_bodies = []
+    evsq_chunks = []
+    midi_ports = set()
+    env_labels = set()
+    environment_objects = []
+    env_seen = set()
+    non_ascii_chunks = []
+
+    for ch in iter_chunks(data):
+        cid = ch["cid"]
+        oid = ch["oid"]
+        body = ch["body"]
+        cid_bytes = ch["cid_bytes"]
+
+        if not all(32 <= b < 127 for b in cid_bytes):
+            # Skip plugin data (null ID) and zero-length placeholders
+            if cid_bytes != b'\x00\x00\x00\x00' and ch["length"] > 0:
+                non_ascii_chunks.append(ch)
+
+        if cid == "AuFl":
+            try:
+                name_len = struct.unpack('<H', body[8:10])[0]
+                if 0 < name_len < 1000:
+                    raw_bytes = body[10 : 10 + (name_len * 2)]
+                    path = raw_bytes.decode('utf-16le', errors='ignore')
+                    audio_files[oid] = os.path.basename(path)
+                    project["summary"]["audio_assets"].append({"name": path, "oid": oid})
+            except Exception:
+                pass
+
+        elif cid == "MSeq":
+            name = parse_mseq_name(body)
+            if name:
+                mseq_names[oid] = name
+            if len(body) >= 0x0C:
+                try:
+                    ref_oid = struct.unpack('<I', body[0x08:0x0C])[0]
+                    if ref_oid and ref_oid != oid:
+                        mseq_parent_refs[oid] = ref_oid
+                except Exception:
+                    pass
+
+        elif cid == "Trak":
+            entry = trak_entries.get(oid, {"oid": oid})
+            if len(body) >= 0x0C:
+                mseq_oid = struct.unpack('<I', body[0x08:0x0C])[0]
+                if mseq_oid:
+                    entry["mseq_oid"] = mseq_oid
+            if len(body) >= 0x28:

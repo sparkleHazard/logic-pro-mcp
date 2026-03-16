@@ -335,4 +335,61 @@ enum AXValueExtractors {
         }
         return nil
     }
+
+    // MARK: - Nesting Depth
+
+    /// Infer the nesting depth of a track header element in the arrange window.
+    ///
+    /// Logic Pro uses an AXOutline for the track list. Rows in an outline have a
+    /// kAXDisclosureLevelAttribute (Int) that indicates indent level.
+    /// If that attribute is unavailable we fall back to inspecting the x-position
+    /// of the track name label relative to the header's own origin as a proxy.
+    static func extractNestingDepth(from header: AXUIElement) -> Int {
+        // Strategy 1: kAXDisclosureLevelAttribute (most reliable on outline rows)
+        if let level: AnyObject = AXHelpers.getAttribute(header, kAXDisclosureLevelAttribute) {
+            if let n = level as? NSNumber {
+                return max(0, n.intValue)
+            }
+        }
+
+        // Strategy 2: "AXIndentationLevel" attribute (seen on some AX versions)
+        if let level: AnyObject = AXHelpers.getAttribute(header, "AXIndentationLevel") {
+            if let n = level as? NSNumber {
+                return max(0, n.intValue)
+            }
+        }
+
+        // Strategy 3: x-position proxy.
+        // In Logic Pro the track name static text is indented for child tracks.
+        // We look at the first static-text child and measure its x-origin relative
+        // to the header's x-origin. Logic uses ~16 px per indent level.
+        if let parentFrame = axFrame(header) {
+            let textElements = AXHelpers.findAllDescendants(of: header, role: kAXStaticTextRole, maxDepth: 3)
+            for textEl in textElements {
+                if let textFrame = axFrame(textEl) {
+                    let indent = textFrame.origin.x - parentFrame.origin.x
+                    if indent > 0 {
+                        return max(0, Int(indent / 16.0))
+                    }
+                    break
+                }
+            }
+        }
+
+        return 0
+    }
+
+    /// Read the CGRect frame for an AX element via the AXFrame attribute.
+    private static func axFrame(_ element: AXUIElement) -> CGRect? {
+        var frameValue: AnyObject?
+        let err = AXUIElementCopyAttributeValue(element, "AXFrame" as CFString, &frameValue)
+        guard err == .success, let v = frameValue else { return nil }
+        var rect = CGRect.zero
+        // AXValue wraps CGRect; we need to extract it via AXValueGetValue
+        let axv = v as! AXValue
+        if AXValueGetValue(axv, .cgRect, &rect) {
+            return rect
+        }
+        return nil
+    }
 }

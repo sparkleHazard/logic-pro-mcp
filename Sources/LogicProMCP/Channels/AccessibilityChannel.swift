@@ -197,6 +197,32 @@ actor AccessibilityChannel: Channel {
         return AXValueExtractors.extractMarkers()
     }
 
+    /// Read the FULL track list from the AX arrange window, including nesting depth.
+    ///
+    /// This supplements / overrides the binary-parser results by reading live state:
+    /// name, type (audio/instrument/aux), mute/solo/arm, and nesting depth.
+    ///
+    /// Nesting depth is inferred from the AX element's indentation level or structural
+    /// position in the tree. Logic Pro uses kAXDisclosureLevelAttribute on outline rows,
+    /// or the x-position of the name label as a proxy for depth.
+    func readLiveTracksDirect() -> [LiveTrackInfo]? {
+        guard AXIsProcessTrusted(), ProcessUtils.isLogicProRunning else { return nil }
+        let headers = AXLogicProElements.allTrackHeaders()
+        guard !headers.isEmpty else { return nil }
+
+        return headers.enumerated().map { (index, header) in
+            let track = AXValueExtractors.extractTrackState(from: header, index: index)
+            var live = LiveTrackInfo(index: index, name: track.name, type: track.type)
+            live.isMuted = track.isMuted
+            live.isSoloed = track.isSoloed
+            live.isArmed = track.isArmed
+            live.isSelected = track.isSelected
+            live.outputRouting = track.outputRouting
+            live.nestingDepth = AXValueExtractors.extractNestingDepth(from: header)
+            return live
+        }
+    }
+
     // MARK: - Transport
 
     private func getTransportState() -> ChannelResult {

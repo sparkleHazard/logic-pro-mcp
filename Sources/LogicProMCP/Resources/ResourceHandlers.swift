@@ -34,6 +34,9 @@ struct ResourceHandlers {
         case "logic://tracks":
             return try await readTracks(cache: cache, axChannel: axChannel, uri: uri)
 
+        case "logic://tracks/live":
+            return try await readLiveTracks(cache: cache, axChannel: axChannel, uri: uri)
+
         case "logic://mixer":
             return try await readMixer(cache: cache, axChannel: axChannel, uri: uri)
 
@@ -88,6 +91,39 @@ struct ResourceHandlers {
             tracks = await cache.getTracks()
         }
         let json = encodeJSON(tracks)
+        return ReadResource.Result(
+            contents: [.text(json, uri: uri, mimeType: "application/json")]
+        )
+    }
+
+    private static func readLiveTracks(
+        cache: StateCache,
+        axChannel: AccessibilityChannel?,
+        uri: String
+    ) async throws -> ReadResource.Result {
+        // Read full live track list including nesting depth from AX tree.
+        if let ax = axChannel, let live = await ax.readLiveTracksDirect() {
+            let json = encodeJSON(live)
+            return ReadResource.Result(
+                contents: [.text(json, uri: uri, mimeType: "application/json")]
+            )
+        }
+        // Fallback: standard tracks from cache (no nesting depth)
+        let tracks = await cache.getTracks()
+        let liveInfos = tracks.map { t in
+            LiveTrackInfo(
+                index: t.id,
+                name: t.name,
+                type: t.type,
+                isMuted: t.isMuted,
+                isSoloed: t.isSoloed,
+                isArmed: t.isArmed,
+                isSelected: t.isSelected,
+                nestingDepth: t.nestingDepth,
+                outputRouting: t.outputRouting
+            )
+        }
+        let json = encodeJSON(liveInfos)
         return ReadResource.Result(
             contents: [.text(json, uri: uri, mimeType: "application/json")]
         )
