@@ -114,6 +114,51 @@ logic_project("bounce_stems", {marker_name: "Verse 1", groups: ["Guitars","Vocal
 | `logic://midi/ports` | Available MIDI input/output ports | 10s |
 | `logic://system/health` | Channel status, cache snapshot, permissions | on-demand |
 
+## Dependencies
+
+### Build Dependencies
+
+| Dependency | Version | Purpose |
+|-----------|---------|---------|
+| **Swift** | 6.0+ | Language and compiler |
+| **macOS SDK** | 14+ (Sonoma) | Target platform |
+| **MCP Swift SDK** | 0.10+ | Model Context Protocol server framework |
+| **Xcode Command Line Tools** | Latest | Build toolchain (`swift build`) |
+
+The MCP Swift SDK is the only external Swift package dependency (fetched automatically by Swift Package Manager). All other frameworks used are system-provided:
+
+### System Frameworks (no install required)
+
+| Framework | Purpose |
+|-----------|---------|
+| `ApplicationServices` | Accessibility API (AXUIElement) for UI automation |
+| `CoreMIDI` | Virtual MIDI ports, MMC transport, note/CC sending |
+| `CoreGraphics` | CGEvent keyboard injection (postToPid, HID tap) |
+| `AppKit` | NSPasteboard (clipboard), NSRunningApplication, NSAppleScript |
+| `Foundation` | Process spawning, file I/O, JSON, property lists |
+| `Network` | UDP sockets for OSC client/server |
+
+### Runtime Dependencies
+
+| Dependency | Required | Purpose |
+|-----------|----------|---------|
+| **Logic Pro** | Yes (for real-time control) | Target application. Binary parser works without Logic running. |
+| **macOS Accessibility permission** | Yes | System Settings → Privacy & Security → Accessibility → add terminal/node |
+| **macOS Automation permission** | Yes | Granted on first AppleScript interaction with Logic Pro |
+| **macOS Screen Recording** | Optional | Only needed for peekaboo screenshot capture |
+| `/usr/bin/osascript` | Yes (system-provided) | Used for focus-dependent keystrokes (solo, mute, cycle toggle) via System Events |
+
+### Custom Logic Pro Key Commands (for automated bouncing)
+
+The bounce automation requires two custom key commands assigned in Logic Pro's Key Commands editor (Option+K):
+
+| Command | Suggested Shortcut | Purpose |
+|---------|-------------------|---------|
+| Set Left Locator to Playhead Position | `Cmd+Ctrl+[` | Sets cycle start point |
+| Set Right Locator to Playhead Position | `Cmd+Ctrl+]` | Sets cycle end point |
+
+These are used by `bounce_stems execute` to set precise cycle ranges for per-song stem bouncing.
+
 ## Installation
 
 ### Build from Source
