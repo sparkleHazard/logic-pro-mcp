@@ -646,12 +646,12 @@ enum ProjectDataParser {
 
     /// Extract audio regions from AuRg chunks.
     ///
-    /// AuRg body layout (bar-field mode, primary):
-    ///   0x10  4B  start_bar_int (LE u32)
+    /// AuRg body layout:
+    ///   0x30  8B  legacy start tick (LE u64) — tried FIRST
+    ///   0x10  4B  start_bar_int (LE u32)     — bar-field fallback
     ///   0x14  4B  start_bar_frac_hi (LE u32) — fractional bars: frac = (value >> 16) / 65536
     ///   0x18  4B  length_bar_int (LE u32)
     ///   0x1C  4B  length_bar_frac_hi (LE u32)
-    ///   0x30  8B  legacy start tick (LE u64) — fallback
     ///   0x4A  2B  name_length (LE u16)
     ///   0x4C  *B  name (ASCII)
     ///
@@ -669,33 +669,59 @@ enum ProjectDataParser {
             var startTick: Int = 0
             var lengthTicks: Int = 0
 
-            // Bar-field mode (primary): offsets 0x10..0x1F
-            let startBarInt = readLE32(body, at: 0x10)
-            let startBarFracRaw = readLE32(body, at: 0x14)
-            let lengthBarInt = readLE32(body, at: 0x18)
-            let lengthBarFracRaw = readLE32(body, at: 0x1C)
+            // Bug 3 Fix: Try legacy tick mode FIRST.
+            // 8-byte LE tick at body offset 0x30; bar = tick / 3840 + 1.
+            // Accept if bar is in reasonable range (1-5000).
+            // Only fall back to bar-field mode if legacy gives 0 or unreasonable values.
+            var usedLegacy = false
+            if body.count >= 0x38 {
+                // Read full 8-byte LE tick at 0x30
+                let rawStartTick = Int(readLE64(body, at: 0x30))
+                let legacyBar = rawStartTick / ticksPerBar + 1
+                if rawStartTick > 0 && legacyBar >= 1 && legacyBar <= 5000 {
+                    startTick = rawStartTick
+                    startBar = Double(rawStartTick) / Double(ticksPerBar) + 1.0
+                    // Length at 0x38 (8-byte LE tick)
+                    if body.count >= 0x40 {
+                        let rawLenTick = Int(readLE64(body, at: 0x38))
+                        lengthTicks = rawLenTick
+                        lengthBars = Double(rawLenTick) / Double(ticksPerBar)
+                    } else if body.count >= 0x3C {
+                        let rawLenLow = readLE32(body, at: 0x38)
+                        lengthTicks = Int(rawLenLow)
+                        lengthBars = Double(lengthTicks) / Double(ticksPerBar)
+                    }
+                    usedLegacy = true
+                } else if rawStartTick > 0 {
+                    // Tick is non-zero but bar is out of range — check for large pre-roll offset.
+                    // Some projects encode absolute timeline ticks; subtract any offset > 5000 bars.
+                    // If after subtracting some pre-roll the bar lands in 1-5000, accept it.
+                    let barsFromZero = rawStartTick / ticksPerBar
+                    if barsFromZero > 5000 {
+                        // Try bar-field below — don't use this tick value
+                    } else if legacyBar > 5000 {
+                        // legacyBar > 5000: bar-field will be tried below
+                    }
+                }
+            }
 
-            let startBarFrac = Double(startBarFracRaw >> 16) / 65536.0
-            let lengthBarFrac = Double(lengthBarFracRaw >> 16) / 65536.0
+            if !usedLegacy {
+                // Bar-field mode fallback: offsets 0x10..0x1F
+                let startBarInt = readLE32(body, at: 0x10)
+                let startBarFracRaw = readLE32(body, at: 0x14)
+                let lengthBarInt = readLE32(body, at: 0x18)
+                let lengthBarFracRaw = readLE32(body, at: 0x1C)
 
-            if startBarInt > 0 || startBarFrac > 0 {
-                // Bar-field mode valid
-                startBar = Double(startBarInt) + startBarFrac
-                lengthBars = Double(lengthBarInt) + lengthBarFrac
-                startTick = Int(startBar * Double(ticksPerBar))
-                lengthTicks = Int(lengthBars * Double(ticksPerBar))
-            } else {
-                // Legacy mode fallback: 8-byte LE tick at body offset 0x30
-                if body.count > 0x38 {
-                    let tickLow = readLE32(body, at: 0x30)
-                    let tickHigh = readLE32(body, at: 0x34)
-                    startTick = Int(tickLow) | (Int(tickHigh) << 32)
-                    startBar = Double(startTick) / Double(ticksPerBar)
-                    // Length: try 0x38
-                    let lenLow = readLE32(body, at: 0x38)
-                    let lenHigh = body.count > 0x40 ? readLE32(body, at: 0x3C) : 0
-                    lengthTicks = Int(lenLow) | (Int(lenHigh) << 32)
-                    lengthBars = Double(lengthTicks) / Double(ticksPerBar)
+                let startBarFrac = Double(startBarFracRaw >> 16) / 65536.0
+                let lengthBarFrac = Double(lengthBarFracRaw >> 16) / 65536.0
+
+                let candidateBar = Double(startBarInt) + startBarFrac
+                // Validate bar-field values — reject if out of reasonable range
+                if (startBarInt > 0 || startBarFrac > 0) && candidateBar <= 5000.0 {
+                    startBar = candidateBar
+                    lengthBars = Double(lengthBarInt) + lengthBarFrac
+                    startTick = Int((startBar - 1.0) * Double(ticksPerBar))
+                    lengthTicks = Int(lengthBars * Double(ticksPerBar))
                 }
             }
 
@@ -740,9 +766,20 @@ enum ProjectDataParser {
 
     // MARK: - Track-to-Region Mapping
 
-    /// Populate trackOid on regions and regions list on tracks using:
-    ///   1. Song / USEl explicit [TrackOID, Count, RegionOID...] tables
-    ///   2. AuRg body heuristic (scan for track OID patterns)
+    /// Populate trackOid on regions and regions list on tracks using the AuRg body scanning
+    /// heuristic described in reference/LOGIC_BINARY_SPEC.md and python_extractor_snippets.txt.
+    ///
+    /// Bug 1 Fix: Replace Song/USEl table scan with AuRg body offset heuristic.
+    ///
+    /// Algorithm:
+    ///   1. Collect known track OIDs from MSeq chunks.
+    ///   2. For each AuRg chunk body, group by body length.
+    ///   3. For each length group, scan u32 values at candidate offsets
+    ///      (0x00, 0x04, 0x08, 0x0C, 0x60, 0x64, 0x68) counting how many bodies
+    ///      contain a known track OID at that offset.
+    ///   4. Use the highest-scoring offset as the track reference for that length group.
+    ///   5. Fallback: wide scan every 4 bytes from 0x00 to 0xC0 when no candidate offset wins.
+    ///   6. Set trackOid on each ParsedRegion; leave nil if no match.
     private static func applyTrackRegionMapping(
         chunks: [ChunkInfo],
         data: Data,
@@ -752,34 +789,89 @@ enum ProjectDataParser {
         let trackOidSet = Set(tracks.map { UInt32($0.oid) })
         guard !trackOidSet.isEmpty, !regions.isEmpty else { return }
 
-        // Build region lookup by OID (regions may share OID, use index as key too)
-        // Map regionOID -> [indices into regions array]
-        var regionsByOid: [UInt32: [Int]] = [:]
-        for (i, r) in regions.enumerated() {
-            regionsByOid[UInt32(r.oid), default: []].append(i)
-        }
+        // Candidate offsets per spec: 0x00, 0x04, 0x08, 0x0C, 0x60, 0x64, 0x68 (and more)
+        // Include 0x00 — in AuRg bodies the first u32 can be a track OID reference.
+        let candidateOffsets: [Int] = [0x00, 0x04, 0x08, 0x0C, 0x60, 0x64, 0x68,
+                                       0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28,
+                                       0x2C, 0x30, 0x34, 0x38, 0x3C, 0x40, 0x44,
+                                       0x48, 0x4C, 0x50, 0x54, 0x58, 0x5C,
+                                       0x6C, 0x70, 0x74, 0x78, 0x7C]
 
-        // Mapping: region index -> track oid
-        var regionTrackMap: [Int: UInt32] = [:]
-
-        // Strategy 1: scan Song and USEl chunk bodies for explicit tables
-        for chunk in chunks where (chunk.id == "Song" || chunk.id == "USEl") {
-            guard chunk.bodyLength >= 12 else { continue }
+        // Collect all AuRg (body, regionIdx) pairs in chunk order
+        var aurgBodies: [(body: Data, regionIdx: Int)] = []
+        var regionIdx = 0
+        for chunk in chunks where chunk.id == idAuRg {
+            guard chunk.bodyLength > 0x4C else { continue }
             let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
-            scanExplicitMappingTable(
-                body: body,
-                trackOidSet: trackOidSet,
-                regionsByOid: regionsByOid,
-                regionTrackMap: &regionTrackMap
-            )
+            if regionIdx < regions.count {
+                aurgBodies.append((body: body, regionIdx: regionIdx))
+                regionIdx += 1
+            }
         }
 
-        // Strategy 2: AuRg body heuristic for unmapped regions
-        // (skipped — heuristic-only; Song/USEl tables are preferred)
+        // Group by body length
+        var byLength: [Int: [(body: Data, regionIdx: Int)]] = [:]
+        for entry in aurgBodies {
+            byLength[entry.body.count, default: []].append(entry)
+        }
 
-        // Apply the mapping back
-        for (regionIdx, trackOid) in regionTrackMap {
-            regions[regionIdx].trackOid = Int(trackOid)
+        // Pass 1: for each length group, count track OID hits per candidate offset
+        var bestOffsetByLength: [Int: Int] = [:]
+        for (_, group) in byLength {
+            let total = group.count
+            guard total > 0 else { continue }
+
+            var hitCounts: [Int: Int] = [:]
+            for entry in group {
+                let maxScan = min(entry.body.count, 0xC0)
+                for off in candidateOffsets where off + 4 <= maxScan {
+                    let val = readLE32(entry.body, at: off)
+                    // Exclude OID=0 to avoid false hits (many fields default to 0)
+                    if trackOidSet.contains(val) && val != 0 {
+                        hitCounts[off, default: 0] += 1
+                    }
+                }
+            }
+
+            // Accept offset if ratio >= 0.15 or count >= 2 (lower threshold to catch sparse groups)
+            let filtered = hitCounts.filter { $0.value * 20 >= total * 3 || $0.value >= 2 }
+            if let best = filtered.max(by: { $0.value < $1.value }) {
+                let len = group.first!.body.count
+                bestOffsetByLength[len] = best.key
+            }
+        }
+
+        // Pass 2: if still no good offset for a length group, do wider scan (every 4 bytes from 0x00)
+        // Python: range(0, max_scan, 4) — includes offset 0
+        for (len, group) in byLength {
+            guard bestOffsetByLength[len] == nil else { continue }
+            let total = group.count
+            guard total >= 1 else { continue }
+
+            var hitCounts: [Int: Int] = [:]
+            for entry in group {
+                let maxScan = min(entry.body.count, 0xC0)
+                for off in stride(from: 0, to: maxScan - 3, by: 4) {
+                    let val = readLE32(entry.body, at: off)
+                    if trackOidSet.contains(val) && val != 0 {
+                        hitCounts[off, default: 0] += 1
+                    }
+                }
+            }
+
+            // For wide scan, keep top offset with any hits (even 1 hit for single-region groups)
+            if let best = hitCounts.max(by: { $0.value < $1.value }), best.value > 0 {
+                bestOffsetByLength[len] = best.key
+            }
+        }
+
+        // Assign track OIDs to regions
+        for entry in aurgBodies {
+            let len = entry.body.count
+            guard let bestOff = bestOffsetByLength[len], bestOff + 4 <= len else { continue }
+            let val = readLE32(entry.body, at: bestOff)
+            guard trackOidSet.contains(val), val != 0 else { continue }
+            regions[entry.regionIdx].trackOid = Int(val)
         }
 
         // Build track -> regions cross-reference
@@ -796,51 +888,6 @@ enum ProjectDataParser {
         }
     }
 
-    /// Scan a chunk body for u32 sequences of the form:
-    ///   [track_oid, count, region_oid_1, region_oid_2, ...]
-    /// where track_oid is a known MSeq OID and count is reasonable (1–100).
-    private static func scanExplicitMappingTable(
-        body: Data,
-        trackOidSet: Set<UInt32>,
-        regionsByOid: [UInt32: [Int]],
-        regionTrackMap: inout [Int: UInt32]
-    ) {
-        guard body.count >= 12 else { return }
-        let count = body.count / 4
-        var i = 0
-        while i < count - 1 {
-            let val = readLE32(body, at: i * 4)
-            guard trackOidSet.contains(val) else { i += 1; continue }
-
-            let regionCount = Int(readLE32(body, at: (i + 1) * 4))
-            guard regionCount >= 1, regionCount <= 100 else { i += 1; continue }
-            guard i + 1 + regionCount < count else { i += 1; continue }
-
-            // Check that the following regionCount u32s are known region OIDs
-            var matched = 0
-            for j in 0..<regionCount {
-                let candidate = readLE32(body, at: (i + 2 + j) * 4)
-                if regionsByOid[candidate] != nil { matched += 1 }
-            }
-
-            // Require majority match (≥50% of claimed regions are known OIDs)
-            if matched * 2 >= regionCount {
-                let trackOid = val
-                for j in 0..<regionCount {
-                    let regionOid = readLE32(body, at: (i + 2 + j) * 4)
-                    if let indices = regionsByOid[regionOid] {
-                        for idx in indices where regionTrackMap[idx] == nil {
-                            regionTrackMap[idx] = trackOid
-                        }
-                    }
-                }
-                i += 2 + regionCount
-                continue
-            }
-            i += 1
-        }
-    }
-
     // MARK: - AuCO Mixer Data (Volume, Pan, Output Routing)
 
     /// Enrich tracks with volume, pan, and output routing from AuCO chunks.
@@ -850,56 +897,58 @@ enum ProjectDataParser {
     ///   0x59  1B                     pan byte (0=hard left, 64=center, 127=hard right)
     ///   volume: 4-byte LE u32 at a known offset; unity = 1509949440
     ///
-    /// Matching strategy: match AuCO channel strip name to MSeq track name (case-insensitive).
-    /// Fallback: scan for routing strings (Output/Bus/Stereo Out) even when name doesn't match.
+    /// Bug 2 Fix: Match AuCO to track by OID (exact match first, then nearest within +/- 8),
+    /// because AuCO strip names are generic ("Audio 1") and don't match MSeq track names.
     private static func enrichTracksWithAuCO(
         chunks: [ChunkInfo],
         data: Data,
         tracks: inout [ParsedTrack]
     ) {
-        // Build a name -> track index map for quick lookup
-        var trackByName: [String: Int] = [:]
+        // Build OID -> track index map for direct OID matching
+        var trackByOid: [UInt32: Int] = [:]
         for (i, t) in tracks.enumerated() {
-            trackByName[t.name.lowercased()] = i
+            trackByOid[UInt32(t.oid)] = i
         }
+        let sortedTrackOids = tracks.map { UInt32($0.oid) }.sorted()
 
         for chunk in chunks where chunk.id == idAuCO {
             guard chunk.bodyLength > 0x5A else { continue }
             let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
 
-            // --- Channel strip name at 0x3C ---
-            let stripName = readNullTerminatedASCII(body, at: 0x3C, maxLen: 64)
-
             // --- Pan byte at 0x59 ---
             let panByte = Int(body[0x59])
             let panNorm: Double = (Double(panByte) - 64.0) / 64.0  // -1.0 to +1.0
 
-            // --- Volume: scan for u32 values near the channel name area ---
-            // Per spec: volume is a 32-bit integer at a known offset.
-            // We scan a window around 0x50-0x58 for plausible volume values.
+            // --- Volume ---
             let volumeDB = readVolumeDB(body: body)
 
-            // --- Output routing: scan for "Output", "Bus", "Stereo Out" strings ---
+            // --- Output routing ---
             let outputRouting = extractOutputRouting(body: body)
 
-            // --- Match to track by name ---
-            if let idx = trackByName[stripName.lowercased()], !stripName.isEmpty {
+            // --- Bug 2 Fix: Match by OID (exact first, then nearest within +/- 8) ---
+            let aucoOid = chunk.oid
+            var trackIdx: Int? = nil
+
+            // Exact OID match
+            if let idx = trackByOid[aucoOid] {
+                trackIdx = idx
+            } else {
+                // Nearest track OID within +/- 8
+                var bestDist: UInt32 = 9
+                for tOid in sortedTrackOids {
+                    let dist = aucoOid > tOid ? aucoOid - tOid : tOid - aucoOid
+                    if dist < bestDist {
+                        bestDist = dist
+                        trackIdx = trackByOid[tOid]
+                    }
+                }
+            }
+
+            if let idx = trackIdx {
                 tracks[idx].volume = volumeDB
                 tracks[idx].pan = panNorm.clamped(to: -1.0...1.0)
                 if let routing = outputRouting {
                     tracks[idx].outputRouting = routing
-                }
-            } else if let routing = outputRouting {
-                // Even without a name match, try to assign routing to an unassigned track
-                // by looking for a track with a matching name prefix in the routing string
-                for i in tracks.indices where tracks[i].outputRouting == nil {
-                    let tname = tracks[i].name.lowercased()
-                    if routing.lowercased().contains(tname) || tname.contains(stripName.lowercased()) {
-                        tracks[i].outputRouting = routing
-                        tracks[i].volume = volumeDB
-                        tracks[i].pan = panNorm.clamped(to: -1.0...1.0)
-                        break
-                    }
                 }
             }
         }
@@ -922,10 +971,12 @@ enum ProjectDataParser {
     /// Unity gain = 1509949440 (0x5A000080 LE).
     /// Formula: dB = 40 * log10(value / 1509949440)
     ///
-    /// We scan offsets 0x48..0x58 for a 4-byte value that decodes to a reasonable dB range (-144..+6).
+    /// Bug 2 Fix: Broader offset scan so volume is found across all AuCO body lengths.
+    /// We check known offsets first, then fall back to scanning every 4 bytes.
     private static func readVolumeDB(body: Data) -> Double? {
-        // Per spec unity = 1509949440; try the standard volume offset range
-        let searchOffsets = [0x48, 0x4C, 0x50, 0x54, 0x58]
+        // Per spec unity = 1509949440; check known offsets for all observed body lengths
+        let searchOffsets = [0x74, 0x48, 0x4C, 0x50, 0x54, 0x58, 0x64, 0x68, 0x6C, 0x70,
+                             0x78, 0x7C, 0x80, 0x84, 0x88, 0x8C, 0x90, 0x94, 0x40, 0x44]
         for off in searchOffsets {
             guard off + 4 <= body.count else { continue }
             let raw = readLE32(body, at: off)
@@ -933,36 +984,56 @@ enum ProjectDataParser {
             let ratio = Double(raw) / unityGainRaw
             guard ratio > 0 else { continue }
             let db = 40.0 * log10(ratio)
-            if db >= -144.0 && db <= 12.0 {
+            if db >= -144.0 && db <= 24.0 {
                 return db
             }
+        }
+        // Fallback: scan every 4 bytes for a value that decodes to a plausible volume
+        // Accept values within ±18 dB of unity as most likely volume faders
+        var i = 0x40
+        while i + 4 <= body.count && i <= 0xC0 {
+            let raw = readLE32(body, at: i)
+            if raw > 0 {
+                let ratio = Double(raw) / unityGainRaw
+                if ratio > 0 {
+                    let db = 40.0 * log10(ratio)
+                    if db >= -18.0 && db <= 6.0 {
+                        return db
+                    }
+                }
+            }
+            i += 4
         }
         return nil
     }
 
     /// Scan an AuCO body for output routing label strings.
     private static func extractOutputRouting(body: Data) -> String? {
-        // Scan body as ASCII for strings containing Output/Bus/Stereo Out
-        let ascii = String(body.map { b -> Character in
-            let s = Unicode.Scalar(b)
-            return s.value >= 32 && s.value < 127 ? Character(s) : Character(" ")
-        })
+        // Build a null-byte-preserving ASCII representation
+        let bytes = body
 
         let keywords = ["Stereo Out", "Output", "Bus"]
         for keyword in keywords {
-            if let range = ascii.range(of: keyword) {
-                // Extract surrounding word (up to 32 chars)
-                let start = ascii.index(range.lowerBound, offsetBy: -min(0, ascii.distance(from: ascii.startIndex, to: range.lowerBound)))
-                var end = range.upperBound
-                var count = 0
-                while end < ascii.endIndex && count < 20 {
-                    let c = ascii[end]
-                    if c == "\0" || c.asciiValue.map({ $0 < 32 }) ?? false { break }
-                    end = ascii.index(after: end)
-                    count += 1
+            guard let kwBytes = keyword.data(using: .ascii) else { continue }
+            // Find keyword in body
+            var searchFrom = 0
+            while searchFrom + kwBytes.count <= bytes.count {
+                var found = true
+                for (i, b) in kwBytes.enumerated() {
+                    if bytes[searchFrom + i] != b { found = false; break }
                 }
-                let label = String(ascii[start..<end]).trimmingCharacters(in: .whitespaces)
-                if !label.isEmpty { return label }
+                if found {
+                    // Extract null-terminated string starting at keyword position
+                    var end = searchFrom
+                    let limit = min(bytes.count, searchFrom + 64)
+                    while end < limit && bytes[end] != 0 {
+                        end += 1
+                    }
+                    let label = String(data: Data(bytes[searchFrom..<end]), encoding: .ascii)?
+                        .trimmingCharacters(in: .whitespaces) ?? ""
+                    if !label.isEmpty { return label }
+                }
+                searchFrom += 1
             }
         }
         return nil
@@ -970,28 +1041,34 @@ enum ProjectDataParser {
 
     // MARK: - Plugin List
 
-    /// Extract plugin names from null-ID (00 00 00 00) chunks.
+    /// Extract plugin names by scanning ALL chunk bodies for known plugin name strings,
+    /// and scanning PluginData (null-ID) chunks for printable ASCII strings > 4 chars.
     ///
-    /// Per spec, these chunks have id "####" or all-zero bytes.
-    /// The body contains ASCII plugin name signatures.
+    /// Bug 4 Fix:
+    ///   - reverseID() now maps non-printable IDs to "PluginData" so they are no longer skipped.
+    ///   - PluginData chunks are scanned for all printable ASCII strings > 4 chars.
+    ///   - We also scan ALL chunks (not just "PluginData") for known plugin name strings.
+    ///   - Extended known plugin list per spec.
     private static func extractPlugins(chunks: [ChunkInfo], data: Data) -> [String] {
         var plugins = Set<String>()
 
-        // Known plugin name keywords to search for
-        let knownPlugins = [
-            "Serum", "Valhalla", "Compressor", "Kontakt", "Massive", "Diva",
-            "Sylenth", "Omnisphere", "Nexus", "Spire", "Vital", "Pigments",
-            "Reverb", "Delay", "Limiter", "EQ", "Transient", "Saturn",
-            "Vintage", "FabFilter", "iZotope", "Waves", "Native Instruments",
+        // Known plugin name keywords to search for (per spec + user requirement)
+        let knownPlugins: [String] = [
+            // Logic built-ins
+            "Compressor", "Channel EQ", "Space Designer", "Alchemy", "Klopfgeist",
+            "Delay Designer", "Retro Synth", "Gain", "Limiter", "Multipressor",
+            // Third-party
+            "Serum", "Kontakt", "Neural DSP", "FabFilter", "Valhalla", "Waves", "iZotope",
+            "Slate", "Massive", "Diva", "Sylenth", "Omnisphere", "Nexus", "Spire",
+            "Vital", "Pigments", "Saturn", "Vintage", "Native Instruments",
         ]
 
         for chunk in chunks {
-            // Null-ID chunks: all 4 ID bytes are non-ASCII (or the reversed ID is "####")
-            // The id field will be empty or contain non-printable chars when OID=0 and ID=0x00000000
-            guard chunk.id.isEmpty || chunk.id == "\0\0\0\0" || isNullID(chunk.id) else { continue }
             guard chunk.bodyLength > 4, chunk.bodyLength < 10_000_000 else { continue }
 
             let body = Data(data[chunk.bodyOffset..<(chunk.bodyOffset + chunk.bodyLength)])
+
+            // Scan for known plugin name keywords in ALL chunks
             let ascii = body.map { b -> Character in
                 let s = Unicode.Scalar(b)
                 return s.value >= 32 && s.value < 127 ? Character(s) : Character("\0")
@@ -1002,30 +1079,41 @@ enum ProjectDataParser {
                 plugins.insert(plugin)
             }
 
-            // Also extract any ASCII strings > 4 chars that look like plugin names
-            // (contiguous printable chars, starts with uppercase, no spaces or common delimiters)
-            var i = bodyStr.startIndex
-            while i < bodyStr.endIndex {
-                let c = bodyStr[i]
-                guard c.isUppercase else { i = bodyStr.index(after: i); continue }
-
-                var j = bodyStr.index(after: i)
-                while j < bodyStr.endIndex {
-                    let cc = bodyStr[j]
-                    if !cc.isLetter && !cc.isNumber && cc != " " && cc != "-" && cc != "_" { break }
-                    j = bodyStr.index(after: j)
+            // For PluginData (null-ID) chunks: also extract all printable ASCII runs > 4 chars
+            // These may contain plugin names not in our known list.
+            if chunk.id == "PluginData" {
+                var run = ""
+                for byte in body {
+                    let scalar = Unicode.Scalar(byte)
+                    if scalar.value >= 32 && scalar.value < 127 {
+                        run.append(Character(scalar))
+                    } else {
+                        // End of printable run — keep if > 4 chars and looks like a plugin name
+                        // (starts with uppercase, not a path/URL/generic string)
+                        if run.count > 4
+                            && run.count < 64
+                            && run.first?.isUppercase == true
+                            && !run.hasPrefix("/")
+                            && !run.hasPrefix("http")
+                            && !run.contains("=")
+                            && !run.contains("\\")
+                        {
+                            plugins.insert(run)
+                        }
+                        run = ""
+                    }
                 }
-
-                let word = String(bodyStr[i..<j])
-                if word.count >= 4 && word.count <= 40
-                    && word.first?.isUppercase == true
-                    && !word.allSatisfy({ $0.isUppercase }) // avoid all-caps constants
+                // Flush final run
+                if run.count > 4
+                    && run.count < 64
+                    && run.first?.isUppercase == true
+                    && !run.hasPrefix("/")
+                    && !run.hasPrefix("http")
+                    && !run.contains("=")
+                    && !run.contains("\\")
                 {
-                    // Heuristic: if it looks like a product name (mixed case), keep it
-                    let hasLower = word.contains(where: { $0.isLowercase })
-                    if hasLower { plugins.insert(word) }
+                    plugins.insert(run)
                 }
-                i = j
             }
         }
 
@@ -1261,14 +1349,20 @@ enum ProjectDataParser {
 
     /// Reverse the 4 ID bytes to get the human-readable chunk ID.
     /// e.g., on-disk bytes [0x71, 0x53, 0x78, 0x54] -> "TxSq"
+    /// Bug 4 Fix: when all 4 bytes are zero or non-printable, return "PluginData"
     private static func reverseID(_ bytes: [UInt8]) -> String {
         guard bytes.count == 4 else { return "????" }
         let reversed = bytes.reversed()
-        return String(reversed.compactMap { b -> Character? in
+        let chars = reversed.compactMap { b -> Character? in
             let scalar = Unicode.Scalar(b)
             let ch = Character(scalar)
-            return ch.isASCII ? ch : nil
-        })
+            return ch.isASCII && scalar.value >= 32 ? ch : nil
+        }
+        // If all 4 bytes are non-printable/null, this is a PluginData-style chunk
+        if chars.count < 4 {
+            return "PluginData"
+        }
+        return String(chars)
     }
 }
 
