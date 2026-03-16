@@ -83,7 +83,19 @@ struct NavigateDispatcher {
             return CallTool.Result(content: [.text("goto_marker requires 'index' or 'name' param")], isError: true)
 
         case "list_markers":
-            // Direct AX read for freshness, fall back to cache.
+            // Try binary parser first for richer data (bar, tick, duration).
+            if let projectPath = currentLogicProProjectPath(),
+               let parsed = ProjectDataParser.parse(path: projectPath),
+               !parsed.markers.isEmpty {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .prettyPrinted
+                if let data = try? encoder.encode(parsed.markers),
+                   let json = String(data: data, encoding: .utf8) {
+                    return CallTool.Result(content: [.text(json)], isError: false)
+                }
+            }
+
+            // Fall back to direct AX read, then cache.
             let markers: [MarkerState]
             if let ax = axChannel, let live = await ax.readMarkersDirect() {
                 await cache.updateMarkers(live)

@@ -152,6 +152,25 @@ struct ResourceHandlers {
         } else {
             info = await cache.getProject()
         }
+
+        // Enrich with binary-parsed data (tempo, time signature, project name) when available.
+        if let projectPath = currentLogicProProjectPath(),
+           let parsed = ProjectDataParser.parse(path: projectPath) {
+            // Fill in fields that AX may leave empty
+            if !parsed.projectName.isEmpty && info.name.isEmpty {
+                info.name = parsed.projectName
+            }
+            if parsed.sampleRate > 0 && info.sampleRate == 0 {
+                info.sampleRate = parsed.sampleRate
+            }
+            if parsed.timeSignature != "4/4" || info.timeSignature == "4/4" {
+                info.timeSignature = parsed.timeSignature
+            }
+            if let first = parsed.tempoMap.first, info.tempo == 120.0 {
+                info.tempo = first.bpm
+            }
+        }
+
         let json = encodeJSON(info)
         return ReadResource.Result(
             contents: [.text(json, uri: uri, mimeType: "application/json")]
@@ -163,6 +182,21 @@ struct ResourceHandlers {
         axChannel: AccessibilityChannel?,
         uri: String
     ) async throws -> ReadResource.Result {
+        // Try binary parser first — it gives richer data (bar, tick, duration) without AX.
+        if let projectPath = currentLogicProProjectPath(),
+           let parsed = ProjectDataParser.parse(path: projectPath),
+           !parsed.markers.isEmpty {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            if let data = try? encoder.encode(parsed.markers),
+               let json = String(data: data, encoding: .utf8) {
+                return ReadResource.Result(
+                    contents: [.text(json, uri: uri, mimeType: "application/json")]
+                )
+            }
+        }
+
+        // Fall back to AX / cache
         let markers: [MarkerState]
         if let ax = axChannel, let live = await ax.readMarkersDirect() {
             await cache.updateMarkers(live)

@@ -6,13 +6,14 @@ struct ProjectDispatcher {
         name: "logic_project",
         description: """
             Project lifecycle in Logic Pro. \
-            Commands: new, open, save, save_as, close, bounce, bounce_section, launch, quit. \
+            Commands: new, open, save, save_as, close, bounce, bounce_section, launch, quit, analyze. \
             Params by command: \
             open -> { path: String }; \
             save_as -> { path: String }; \
             bounce -> {} (opens bounce dialog); \
             bounce_section -> { marker_name: String } or { start_bar: Int, end_bar: Int } \
             (sets cycle range to section boundaries, enables cycle, opens bounce dialog); \
+            analyze -> { path: String? } (parse ProjectData binary; defaults to current project); \
             launch/quit -> {} (app lifecycle); \
             Others -> {}
             """,
@@ -81,6 +82,9 @@ struct ProjectDispatcher {
         case "bounce_section":
             return await bounceSection(params: params, router: router, cache: cache, axChannel: axChannel)
 
+        case "analyze":
+            return analyzeProject(params: params)
+
         case "launch":
             if ProcessUtils.isLogicProRunning {
                 return CallTool.Result(content: [.text("Logic Pro is already running")], isError: false)
@@ -115,10 +119,50 @@ struct ProjectDispatcher {
 
         default:
             return CallTool.Result(
-                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, launch, quit")],
+                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, analyze, launch, quit")],
                 isError: true
             )
         }
+    }
+
+    // MARK: - analyze
+
+    /// Parse the ProjectData binary for the given (or current) Logic Pro project and return
+    /// a JSON summary of markers, tempo map, tracks, and project metadata.
+    private static func analyzeProject(params: [String: Value]) -> CallTool.Result {
+        // Prefer explicitly supplied path; fall back to AppleScript discovery.
+        let path: String?
+        if let explicit = params["path"]?.stringValue, !explicit.isEmpty {
+            path = explicit
+        } else {
+            path = currentLogicProProjectPath()
+        }
+
+        guard let projectPath = path else {
+            return CallTool.Result(
+                content: [.text("analyze: could not determine project path. Pass 'path' param or ensure Logic Pro is open.")],
+                isError: true
+            )
+        }
+
+        guard let info = ProjectDataParser.parse(path: projectPath) else {
+            return CallTool.Result(
+                content: [.text("analyze: failed to parse ProjectData at '\(projectPath)'. Check the path and that the file is a valid .logicx project.")],
+                isError: true
+            )
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(info),
+              let json = String(data: data, encoding: .utf8) else {
+            return CallTool.Result(
+                content: [.text("analyze: failed to encode result as JSON")],
+                isError: true
+            )
+        }
+
+        return CallTool.Result(content: [.text(json)], isError: false)
     }
 
     // MARK: - bounce_section
