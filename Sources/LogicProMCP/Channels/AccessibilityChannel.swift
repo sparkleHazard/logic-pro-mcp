@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import Foundation
 
@@ -398,43 +399,51 @@ actor AccessibilityChannel: Channel {
         }
 
         // Wait for the dialog to appear
-        Thread.sleep(forTimeInterval: 0.3)
+        Thread.sleep(forTimeInterval: 0.4)
 
-        // Type the track name using CGEvent
+        // Use clipboard paste — CGEvent unicode typing doesn't work in Logic's search dialog
         guard let source = CGEventSource(stateID: .hidSystemState) else { return false }
 
-        // First clear any existing text with Cmd+A then type the name
+        // Put track name on clipboard
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(name, forType: .string)
+
+        // Cmd+A to select existing text
         if let selAll = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
            let selAllUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
             selAll.flags = .maskCommand
             selAllUp.flags = .maskCommand
-            selAll.postToPid(pid)
-            selAllUp.postToPid(pid)
+            selAll.post(tap: .cghidEventTap)
+            usleep(30_000)
+            selAllUp.post(tap: .cghidEventTap)
         }
         Thread.sleep(forTimeInterval: 0.05)
 
-        // Type each character of the track name
-        for scalar in name.unicodeScalars {
-            let char = scalar.value
-            // Use CGEventKeyboardSetUnicodeString for arbitrary characters
-            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
-                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { continue }
-            var utf16 = [UniChar(char & 0xFFFF)]
-            keyDown.keyboardSetUnicodeString(stringLength: 1, unicodeString: &utf16)
-            keyUp.keyboardSetUnicodeString(stringLength: 1, unicodeString: &utf16)
-            keyDown.postToPid(pid)
-            keyUp.postToPid(pid)
+        // Cmd+V to paste
+        if let pasteDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
+           let pasteUp = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) {
+            pasteDown.flags = .maskCommand
+            pasteUp.flags = .maskCommand
+            pasteDown.post(tap: .cghidEventTap)
+            usleep(30_000)
+            pasteUp.post(tap: .cghidEventTap)
         }
 
-        Thread.sleep(forTimeInterval: 0.2)
+        Thread.sleep(forTimeInterval: 0.3)
 
-        // Press Return to confirm
+        // Press Return to confirm selection
         guard let returnDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
               let returnUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else { return false }
-        returnDown.postToPid(pid)
-        returnUp.postToPid(pid)
+        returnDown.post(tap: .cghidEventTap)
+        returnUp.post(tap: .cghidEventTap)
 
-        Thread.sleep(forTimeInterval: 0.1)
+        // Wait for search dialog to close. The search dialog returns focus to the arrange
+        // area automatically — no need to click. AppleScript keystroke via System Events
+        // will target the frontmost app (Logic Pro) regardless.
+        Thread.sleep(forTimeInterval: 0.3)
+
+        Thread.sleep(forTimeInterval: 0.15)
         return true
     }
 
@@ -446,29 +455,42 @@ actor AccessibilityChannel: Channel {
         return .error("Failed to select track '\(name)' via menu search")
     }
 
-    /// Select a track by name then toggle mute/solo/arm via CGEvent key press.
+    /// Select a track by name then toggle mute/solo/arm via AppleScript keystroke.
+    /// AppleScript `keystroke` via System Events properly injects into the focused app,
+    /// unlike CGEvent.post which Logic ignores for focus-dependent shortcuts.
     private func toggleTrackByNameMenu(name: String, key: CGKeyCode, keyLabel: String) -> ChannelResult {
-        guard let pid = ProcessUtils.logicProPID() else {
-            return .error("Logic Pro is not running")
-        }
-
         let selected = AccessibilityChannel.selectTrackByNameViaMenu(name)
         guard selected else {
             return .error("Cannot select track '\(name)' — track search failed")
         }
 
-        // Brief pause so Logic registers the track selection before toggle
-        Thread.sleep(forTimeInterval: 0.1)
+        // Brief pause so Logic registers the track selection
+        Thread.sleep(forTimeInterval: 0.15)
 
-        guard let source = CGEventSource(stateID: .hidSystemState),
-              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
-              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false) else {
-            return .error("Failed to create CGEvent for \(keyLabel) key")
+        // Map key label to character
+        let keyChar: String
+        switch keyLabel {
+        case "Solo": keyChar = "s"
+        case "Mute": keyChar = "m"
+        case "Arm", "Record": keyChar = "r"
+        default: keyChar = "s"
         }
-        keyDown.postToPid(pid)
-        keyUp.postToPid(pid)
 
-        return .success("{\"track\":\"\(name)\",\"toggled\":\"\(keyLabel)\",\"via\":\"AX_menu_search\"}")
+        // Use osascript subprocess — NSAppleScript hangs in the MCP server process,
+        // but spawning osascript works reliably
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", "tell application \"System Events\" to keystroke \"\(keyChar)\""]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            return .error("osascript keystroke failed: \(error)")
+        }
+
+        return .success("{\"track\":\"\(name)\",\"toggled\":\"\(keyLabel)\",\"via\":\"AX_menu+osascript\"}")
     }
 
     // MARK: - Tracks

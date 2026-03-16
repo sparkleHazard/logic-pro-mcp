@@ -219,10 +219,15 @@ actor CGEventChannel: Channel {
         keyDown.flags = flags
         keyUp.flags = flags
 
-        keyDown.postToPid(pid)
-        keyUp.postToPid(pid)
+        // Post to HID system tap (mimics physical keyboard) rather than postToPid.
+        // postToPid bypasses the window focus chain, so focus-dependent shortcuts
+        // like S (solo), M (mute), C (cycle) don't work. HID posting goes through
+        // the normal event dispatch and reaches the focused responder.
+        keyDown.post(tap: .cghidEventTap)
+        usleep(50_000) // 50ms between key down and up for reliability
+        keyUp.post(tap: .cghidEventTap)
 
-        Log.debug("Posted key \(keyCode) flags \(flags.rawValue) to PID \(pid)", subsystem: "cgEvent")
+        Log.debug("Posted key \(keyCode) flags \(flags.rawValue) via HID tap", subsystem: "cgEvent")
         return true
     }
 }

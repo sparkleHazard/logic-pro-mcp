@@ -536,8 +536,8 @@ struct ProjectDispatcher {
                            let source = CGEventSource(stateID: .hidSystemState),
                            let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: true),
                            let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: false) {
-                            keyDown.postToPid(pid)
-                            keyUp.postToPid(pid)
+                            keyDown.post(tap: .cghidEventTap)
+                            keyUp.post(tap: .cghidEventTap)
                             soloedNames.append(stripName)
                             log.append("    Soloed '\(stripName)' via menu search + S key")
                         } else {
@@ -606,8 +606,8 @@ struct ProjectDispatcher {
                    let source = CGEventSource(stateID: .hidSystemState),
                    let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: true),
                    let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: false) {
-                    keyDown.postToPid(pid)
-                    keyUp.postToPid(pid)
+                    keyDown.post(tap: .cghidEventTap)
+                    keyUp.post(tap: .cghidEventTap)
                 }
             }
             // Un-solo by index (legacy fallback)
