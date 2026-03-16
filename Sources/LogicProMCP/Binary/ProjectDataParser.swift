@@ -169,6 +169,10 @@ enum ProjectDataParser {
         info.trakEntries = trakEntries
         info.environmentLabels = environmentLabels
         info.subTrackHierarchy = subTrackHierarchy
+
+        // Compute per-song lengths from reference track (or marker boundary fallback)
+        info.songLengths = computeSongLengthsFromReference(info: info)
+
         return info
     }
 
@@ -2015,6 +2019,225 @@ enum ProjectDataParser {
             }
         }
         return nil
+    }
+
+    // MARK: - Track Index Map (Envi name → AX track index)
+
+    /// Build a mapping of Envi name → AX track index by fuzzy-matching Envi names
+    /// against the live track list read from the AX arrange window.
+    ///
+    /// Matching strategy (priority order):
+    ///   1. Exact name match (case-insensitive).
+    ///   2. Contains match — Envi name contains live name or vice versa.
+    ///   3. Token overlap — both names share ≥2 word tokens.
+    ///
+    /// Returns a dictionary: Envi name → AX 0-based track index.
+    static func buildTrackIndexMap(
+        enviNames: [String],
+        liveTracks: [LiveTrackInfo]
+    ) -> [String: Int] {
+        var result: [String: Int] = [:]
+
+        // Pre-compute lowercased live track names and their token sets for speed.
+        let liveNamesLower = liveTracks.map { $0.name.lowercased() }
+        let liveTokens: [[String]] = liveNamesLower.map { tokenise($0) }
+
+        for enviName in enviNames {
+            let enviLower = enviName.lowercased()
+            let enviToks = tokenise(enviLower)
+
+            // --- Pass 1: exact (case-insensitive) ---
+            if let idx = liveNamesLower.firstIndex(of: enviLower) {
+                result[enviName] = liveTracks[idx].index
+                continue
+            }
+
+            // --- Pass 2: contains ---
+            var containsIdx: Int? = nil
+            for (i, liveLow) in liveNamesLower.enumerated() {
+                if enviLower.contains(liveLow) || liveLow.contains(enviLower) {
+                    containsIdx = i
+                    break
+                }
+            }
+            if let idx = containsIdx {
+                result[enviName] = liveTracks[idx].index
+                continue
+            }
+
+            // --- Pass 3: token overlap (≥2 shared tokens) ---
+            if !enviToks.isEmpty {
+                var bestScore = 1          // need at least 2 to qualify
+                var bestIdx: Int? = nil
+                let enviSet = Set(enviToks)
+                for (i, toks) in liveTokens.enumerated() where !toks.isEmpty {
+                    let overlap = toks.filter { enviSet.contains($0) }.count
+                    if overlap > bestScore {
+                        bestScore = overlap
+                        bestIdx = i
+                    }
+                }
+                if let idx = bestIdx {
+                    result[enviName] = liveTracks[idx].index
+                }
+            }
+        }
+
+        return result
+    }
+
+    /// Split a name into lowercase word tokens (letters/digits only).
+    private static func tokenise(_ text: String) -> [String] {
+        return text
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 2 }
+    }
+
+    // MARK: - Song Lengths from Reference Track
+
+    /// Compute per-song lengths using reference track regions for accuracy.
+    ///
+    /// Strategy:
+    ///   1. Find the "Release Track" or "Reference" in the sub-track hierarchy
+    ///      (classified as functionGroup == "Reference").
+    ///   2. Collect all regions assigned to that track (via trackOid mapping).
+    ///   3. For each song marker, find a reference region that starts at (or near)
+    ///      the marker bar, and use that region's length.
+    ///   4. If no region overlaps a marker, try matching region name to marker name
+    ///      (e.g. region "New Beginnings" matches marker "New Beginnings").
+    ///   5. Fallback: marker-to-next-marker boundary.
+    ///
+    /// Returns one SongLength per arrangement marker, sorted by startBar.
+    static func computeSongLengthsFromReference(
+        info: ProjectDataInfo
+    ) -> [SongLength] {
+        let markers = info.markers.sorted { $0.bar < $1.bar }
+        guard !markers.isEmpty else { return [] }
+
+        // --- Find reference track OID ---
+        // Look in subTrackHierarchy for a stack named "Release Track" or "Reference".
+        let referenceStackNames: Set<String> = ["Release Track", "Reference", "Ref", "release track"]
+        var referenceTrackOids: Set<Int> = []
+
+        for stack in info.subTrackHierarchy {
+            if referenceStackNames.contains(stack.name)
+                || stack.name.lowercased().contains("release")
+                || stack.name.lowercased().contains("reference")
+            {
+                for strip in stack.strips {
+                    if let mseqOid = strip.mseqOid { referenceTrackOids.insert(mseqOid) }
+                    if strip.trakOid != nil || strip.mseqOid != nil {
+                        referenceTrackOids.insert(strip.oid)
+                    }
+                }
+            }
+        }
+        // Also check MSeq tracks by function group
+        for track in info.tracks where track.functionGroup == "Reference" {
+            referenceTrackOids.insert(track.oid)
+        }
+
+        // --- Collect reference regions ---
+        let referenceRegions: [ParsedRegion]
+        if !referenceTrackOids.isEmpty {
+            referenceRegions = info.regions.filter { region in
+                guard let tOid = region.trackOid else { return false }
+                return referenceTrackOids.contains(tOid)
+            }
+        } else {
+            referenceRegions = []
+        }
+
+        // --- Build a name-based region lookup (region.name lowercased → region) ---
+        var regionByName: [String: ParsedRegion] = [:]
+        for region in referenceRegions where !region.name.isEmpty {
+            let key = region.name.lowercased()
+            // Keep the longest region when names clash
+            if let existing = regionByName[key], existing.lengthBars >= region.lengthBars { continue }
+            regionByName[key] = region
+        }
+        // Also index by stripped names (without ".N" suffix like "Dead and Buried.2")
+        var regionByBaseName: [String: ParsedRegion] = [:]
+        for region in referenceRegions where !region.name.isEmpty {
+            let stripped = stripRegionSuffix(region.name).lowercased()
+            if let existing = regionByBaseName[stripped], existing.lengthBars >= region.lengthBars { continue }
+            regionByBaseName[stripped] = region
+        }
+
+        // --- Compute song lengths ---
+        var songLengths: [SongLength] = []
+
+        for (i, marker) in markers.enumerated() {
+            let markerStartBar = marker.bar
+            let markerEndBar: Int
+            if i + 1 < markers.count {
+                markerEndBar = markers[i + 1].bar
+            } else {
+                markerEndBar = marker.bar + marker.durationBars
+            }
+            let markerBoundaryLength = markerEndBar - markerStartBar
+
+            // --- Try to find a reference region ---
+            var matchedRegion: ParsedRegion? = nil
+
+            // 1. Overlapping by bar position: region starts within ±2 bars of marker
+            if !referenceRegions.isEmpty {
+                matchedRegion = referenceRegions.first { region in
+                    let regionStartInt = Int(region.startBar.rounded())
+                    return abs(regionStartInt - markerStartBar) <= 2
+                }
+            }
+
+            // 2. Name match: marker name matches region name (or base name)
+            if matchedRegion == nil {
+                let markerKey = marker.name.lowercased()
+                matchedRegion = regionByName[markerKey] ?? regionByBaseName[markerKey]
+            }
+
+            // 3. Partial name match (marker name contained in region base name or vice versa)
+            if matchedRegion == nil && !referenceRegions.isEmpty {
+                let markerKey = marker.name.lowercased()
+                matchedRegion = referenceRegions.first { region in
+                    let rKey = stripRegionSuffix(region.name).lowercased()
+                    return rKey.contains(markerKey) || markerKey.contains(rKey)
+                }
+            }
+
+            if let region = matchedRegion, region.lengthBars > 0 {
+                let lengthBars = max(1, Int(region.lengthBars.rounded()))
+                songLengths.append(SongLength(
+                    songName: marker.name,
+                    startBar: markerStartBar,
+                    endBar: markerStartBar + lengthBars,
+                    lengthBars: lengthBars,
+                    source: "reference_region"
+                ))
+            } else {
+                // Fallback: marker-to-marker boundary
+                songLengths.append(SongLength(
+                    songName: marker.name,
+                    startBar: markerStartBar,
+                    endBar: markerEndBar,
+                    lengthBars: markerBoundaryLength,
+                    source: "marker_boundary"
+                ))
+            }
+        }
+
+        return songLengths
+    }
+
+    /// Strip a trailing ".N" numeric suffix from a region name.
+    /// e.g. "Dead and Buried.2" → "Dead and Buried"
+    private static func stripRegionSuffix(_ name: String) -> String {
+        // Pattern: name ends with ".<digits>"
+        if let dotIdx = name.lastIndex(of: ".") {
+            let suffix = String(name[name.index(after: dotIdx)...])
+            if !suffix.isEmpty && suffix.allSatisfy({ $0.isNumber }) {
+                return String(name[name.startIndex..<dotIdx])
+            }
+        }
+        return name
     }
 
     // MARK: - Low-level Readers

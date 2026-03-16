@@ -7,7 +7,7 @@ struct ProjectDispatcher {
         description: """
             Project lifecycle in Logic Pro. \
             Commands: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, \
-            tracks_hierarchy, bounce_stems, launch, quit, analyze. \
+            tracks_hierarchy, bounce_stems, song_lengths, launch, quit, analyze. \
             Params by command: \
             open -> { path: String }; \
             save_as -> { path: String }; \
@@ -18,7 +18,9 @@ struct ProjectDispatcher {
             (best-effort AX automation of the open bounce dialog: set path, click Bounce); \
             tracks_hierarchy -> { path: String? } (full track tree with stacks and function groups); \
             bounce_stems -> { path: String?, marker_name: String?, start_bar: Int?, end_bar: Int?, \
-            groups: [String]?, execute: Bool? } (plan or execute per-group stem bounces); \
+            groups: [String]?, use_reference_lengths: Bool?, execute: Bool? } \
+            (plan or execute per-group stem bounces; use_reference_lengths defaults true); \
+            song_lengths -> { path: String? } (per-song lengths from reference track or marker boundaries); \
             analyze -> { path: String? } (parse ProjectData binary; defaults to current project); \
             launch/quit -> {} (app lifecycle); \
             Others -> {}
@@ -92,10 +94,13 @@ struct ProjectDispatcher {
             return analyzeProject(params: params)
 
         case "tracks_hierarchy":
-            return tracksHierarchy(params: params)
+            return await tracksHierarchy(params: params, axChannel: axChannel)
 
         case "bounce_stems":
             return await bounceStems(params: params, router: router, cache: cache, axChannel: axChannel)
+
+        case "song_lengths":
+            return songLengths(params: params)
 
         case "bounce_complete":
             return await bounceComplete(params: params, axChannel: axChannel)
@@ -134,7 +139,7 @@ struct ProjectDispatcher {
 
         default:
             return CallTool.Result(
-                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, tracks_hierarchy, bounce_stems, analyze, launch, quit")],
+                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, bounce_complete, tracks_hierarchy, bounce_stems, song_lengths, analyze, launch, quit")],
                 isError: true
             )
         }
@@ -143,7 +148,10 @@ struct ProjectDispatcher {
     // MARK: - tracks_hierarchy
 
     /// Return the full track tree with stacks, children, and function groups.
-    private static func tracksHierarchy(params: [String: Value]) -> CallTool.Result {
+    private static func tracksHierarchy(
+        params: [String: Value],
+        axChannel: AccessibilityChannel?
+    ) async -> CallTool.Result {
         let path: String?
         if let explicit = params["path"]?.stringValue, !explicit.isEmpty {
             path = explicit
@@ -163,6 +171,23 @@ struct ProjectDispatcher {
                 content: [.text("tracks_hierarchy: failed to parse ProjectData at '\(projectPath)'.")],
                 isError: true
             )
+        }
+
+        // Read live tracks from AX (if Logic is open) for the track index map
+        let liveTracks: [LiveTrackInfo]?
+        if let ax = axChannel {
+            liveTracks = await ax.readLiveTracksDirect()
+        } else {
+            liveTracks = nil
+        }
+
+        // Build Envi name → AX track index map (only when live tracks are available)
+        let trackIndexMap: [String: Int]?
+        if let live = liveTracks, !live.isEmpty {
+            let enviNames = info.environmentLabels
+            trackIndexMap = ProjectDataParser.buildTrackIndexMap(enviNames: enviNames, liveTracks: live)
+        } else {
+            trackIndexMap = nil
         }
 
         // --- Section 1: MSeq-level arrangement tracks (existing) ---
@@ -227,7 +252,7 @@ struct ProjectDispatcher {
         let namedStrips = info.channelStrips.filter { !$0.isGeneric }.count
         let envLabels = info.environmentLabels
 
-        let result: [String: Any] = [
+        var result: [String: Any] = [
             "project": info.projectName,
             "mseqTrackCount": tracks.count,
             "channelStripCount": totalStrips,
@@ -240,6 +265,11 @@ struct ProjectDispatcher {
             ],
             "subTrackHierarchy": subHierarchy,
         ]
+
+        // Include trackIndexMap when live tracks are available
+        if let indexMap = trackIndexMap, !indexMap.isEmpty {
+            result["trackIndexMap"] = indexMap
+        }
 
         guard let jsonData = try? JSONSerialization.data(
             withJSONObject: result,
@@ -259,6 +289,7 @@ struct ProjectDispatcher {
     ///   - path: .logicx path (optional, auto-detected if omitted)
     ///   - marker_name / start_bar + end_bar: section to bounce
     ///   - groups: array of function group / stack names to include (nil = all)
+    ///   - use_reference_lengths: Bool (default true) — use reference track region length for the song
     ///   - execute: Bool (default false) — when true, solo + bounce each group
     private static func bounceStems(
         params: [String: Value],
@@ -287,9 +318,32 @@ struct ProjectDispatcher {
             )
         }
 
+        // --- Read live tracks from AX (for track index mapping) ---
+        let liveTracks: [LiveTrackInfo]?
+        if let ax = axChannel {
+            liveTracks = await ax.readLiveTracksDirect()
+        } else {
+            liveTracks = nil
+        }
+
+        // Build Envi name → AX track index map
+        let trackIndexMap: [String: Int]
+        if let live = liveTracks, !live.isEmpty {
+            trackIndexMap = ProjectDataParser.buildTrackIndexMap(
+                enviNames: info.environmentLabels,
+                liveTracks: live
+            )
+        } else {
+            trackIndexMap = [:]
+        }
+
         // --- Resolve section bars ---
+        let useReferenceLengths = params["use_reference_lengths"]?.boolValue ?? true
+
         var startBar: Int
         var endBar: Int
+        var markerEndBar: Int   // marker-to-marker boundary (always computed)
+        var referenceLength: [String: Any]? = nil
 
         if let markerName = params["marker_name"]?.stringValue {
             let sorted = info.markers.sorted { $0.bar < $1.bar }
@@ -301,16 +355,34 @@ struct ProjectDispatcher {
             }
             startBar = target.bar
             if let next = sorted.first(where: { $0.bar > startBar }) {
-                endBar = next.bar
+                markerEndBar = next.bar
             } else {
-                endBar = startBar + target.durationBars
+                markerEndBar = startBar + target.durationBars
+            }
+
+            // Look for a reference-track-derived song length
+            if useReferenceLengths,
+               let songLen = info.songLengths.first(where: { $0.songName.localizedCaseInsensitiveContains(markerName) })
+            {
+                endBar = songLen.endBar
+                referenceLength = [
+                    "startBar": songLen.startBar,
+                    "endBar": songLen.endBar,
+                    "lengthBars": songLen.lengthBars,
+                    "source": songLen.source,
+                ]
+            } else {
+                endBar = markerEndBar
             }
         } else if let sb = params["start_bar"]?.intValue, let eb = params["end_bar"]?.intValue {
-            startBar = sb; endBar = eb
+            startBar = sb
+            endBar = eb
+            markerEndBar = eb
         } else {
             // Default: full project (bar 1 to last marker end)
             startBar = 1
-            endBar = (info.markers.map { $0.bar + $0.durationBars }.max() ?? 9) + 1
+            markerEndBar = (info.markers.map { $0.bar + $0.durationBars }.max() ?? 9) + 1
+            endBar = markerEndBar
         }
 
         // --- Build stem groups from sub-track hierarchy (channel strips) ---
@@ -327,7 +399,7 @@ struct ProjectDispatcher {
         var groups: [[String: Any]] = []
 
         if !info.subTrackHierarchy.isEmpty {
-            // Channel-strip-based groups (the full 449 sub-tracks)
+            // Channel-strip-based groups (the full sub-tracks)
             for stack in info.subTrackHierarchy {
                 if let requested = requestedGroups, !requested.contains(stack.name) { continue }
 
@@ -335,13 +407,29 @@ struct ProjectDispatcher {
                 let meaningfulStrips = stack.strips.filter { !$0.isGeneric }
                 if meaningfulStrips.isEmpty { continue }
 
-                groups.append([
+                // Build strip info including AX track indices
+                let stripNodes: [[String: Any]] = meaningfulStrips.map { strip -> [String: Any] in
+                    var node: [String: Any] = ["name": strip.name]
+                    if let axIdx = trackIndexMap[strip.name] {
+                        node["trackIndex"] = axIdx
+                    }
+                    return node
+                }
+
+                var groupEntry: [String: Any] = [
                     "name": stack.name,
                     "source": stack.source,
                     "stripOids": meaningfulStrips.map { $0.oid },
                     "stripNames": meaningfulStrips.map { $0.name },
                     "mseqOids": Array(Set(meaningfulStrips.compactMap { $0.mseqOid })).sorted(),
-                ])
+                    "strips": stripNodes,
+                ]
+                // Collect AX indices for all strips in this group
+                let groupAxIndices = meaningfulStrips.compactMap { trackIndexMap[$0.name] }
+                if !groupAxIndices.isEmpty {
+                    groupEntry["trackIndices"] = groupAxIndices.sorted()
+                }
+                groups.append(groupEntry)
             }
         } else {
             // Fallback: group MSeq tracks by function group (legacy behaviour)
@@ -353,23 +441,51 @@ struct ProjectDispatcher {
             }
             for groupName in groupMap.keys.sorted() {
                 let members = groupMap[groupName]!
+                let stripNodes: [[String: Any]] = members.map { track -> [String: Any] in
+                    var node: [String: Any] = ["name": track.name]
+                    if let axIdx = trackIndexMap[track.name] {
+                        node["trackIndex"] = axIdx
+                    }
+                    return node
+                }
                 groups.append([
                     "name": groupName,
                     "source": "function_group_mseq",
                     "stripOids": members.map { $0.oid },
                     "stripNames": members.map { $0.name },
                     "mseqOids": members.map { $0.oid },
+                    "strips": stripNodes,
                 ])
             }
         }
 
-        let plan: [String: Any] = [
+        // --- Build plan ---
+        var plan: [String: Any] = [
             "song": info.projectName,
             "bars": [startBar, endBar],
+            "markerBars": [startBar, markerEndBar],
             "channelStripCount": info.channelStrips.count,
             "namedStrips": info.channelStrips.filter { !$0.isGeneric }.count,
             "groups": groups,
         ]
+
+        if let refLen = referenceLength {
+            plan["referenceLength"] = refLen
+        }
+
+        // Include per-song lengths table
+        if !info.songLengths.isEmpty {
+            let songLengthsJson = info.songLengths.map { sl -> [String: Any] in
+                return [
+                    "songName": sl.songName,
+                    "startBar": sl.startBar,
+                    "endBar": sl.endBar,
+                    "lengthBars": sl.lengthBars,
+                    "source": sl.source,
+                ]
+            }
+            plan["songLengths"] = songLengthsJson
+        }
 
         let execute = params["execute"]?.boolValue ?? false
         guard execute else {
@@ -399,25 +515,41 @@ struct ProjectDispatcher {
         _ = await router.route(operation: "transport.toggle_cycle")
 
         for group in groups {
-            guard let groupName = group["name"] as? String,
-                  let oids = group["stripOids"] as? [Int],
-                  let names = group["stripNames"] as? [String] else { continue }
-
+            guard let groupName = group["name"] as? String else { continue }
+            let names = group["stripNames"] as? [String] ?? []
             log.append("  Group '\(groupName)': \(names.joined(separator: ", "))")
 
-            // Solo tracks by index — use MSeq track indices where available,
-            // falling back to position in the public tracks array for OID proximity
+            // Prefer AX track indices from the live track index map
             var soloedIndices: [Int] = []
-            let mseqOids = (group["mseqOids"] as? [Int]) ?? oids
-            for (trackIdx, track) in info.tracks.enumerated() where mseqOids.contains(track.oid) {
-                let soloResult = await router.route(
-                    operation: "track.set_solo",
-                    params: ["index": "\(trackIdx)", "enabled": "true"]
-                )
-                if soloResult.isSuccess {
-                    soloedIndices.append(trackIdx)
-                } else {
-                    log.append("    WARNING: solo track \(trackIdx) (\(track.name)) failed: \(soloResult.message)")
+            let groupAxIndices = group["trackIndices"] as? [Int] ?? []
+
+            if !groupAxIndices.isEmpty {
+                // Solo by AX index
+                for axIdx in groupAxIndices {
+                    let soloResult = await router.route(
+                        operation: "track.set_solo",
+                        params: ["index": "\(axIdx)", "enabled": "true"]
+                    )
+                    if soloResult.isSuccess {
+                        soloedIndices.append(axIdx)
+                    } else {
+                        log.append("    WARNING: solo AX track \(axIdx) failed: \(soloResult.message)")
+                    }
+                }
+            } else {
+                // Fallback: solo by MSeq position in info.tracks
+                let oids = group["stripOids"] as? [Int] ?? []
+                let mseqOids = (group["mseqOids"] as? [Int]) ?? oids
+                for (trackIdx, track) in info.tracks.enumerated() where mseqOids.contains(track.oid) {
+                    let soloResult = await router.route(
+                        operation: "track.set_solo",
+                        params: ["index": "\(trackIdx)", "enabled": "true"]
+                    )
+                    if soloResult.isSuccess {
+                        soloedIndices.append(trackIdx)
+                    } else {
+                        log.append("    WARNING: solo track \(trackIdx) (\(track.name)) failed: \(soloResult.message)")
+                    }
                 }
             }
 
@@ -435,6 +567,57 @@ struct ProjectDispatcher {
         }
 
         return CallTool.Result(content: [.text(log.joined(separator: "\n"))], isError: false)
+    }
+
+    // MARK: - song_lengths
+
+    /// Return per-song lengths derived from the reference track regions (or marker boundaries).
+    private static func songLengths(params: [String: Value]) -> CallTool.Result {
+        let path: String?
+        if let explicit = params["path"]?.stringValue, !explicit.isEmpty {
+            path = explicit
+        } else {
+            path = currentLogicProProjectPath()
+        }
+
+        guard let projectPath = path else {
+            return CallTool.Result(
+                content: [.text("song_lengths: could not determine project path. Pass 'path' param or ensure Logic Pro is open.")],
+                isError: true
+            )
+        }
+
+        guard let info = ProjectDataParser.parse(path: projectPath) else {
+            return CallTool.Result(
+                content: [.text("song_lengths: failed to parse ProjectData at '\(projectPath)'.")],
+                isError: true
+            )
+        }
+
+        let songLengthsJson: [[String: Any]] = info.songLengths.map { sl in
+            return [
+                "songName": sl.songName,
+                "startBar": sl.startBar,
+                "endBar": sl.endBar,
+                "lengthBars": sl.lengthBars,
+                "source": sl.source,
+            ]
+        }
+
+        let result: [String: Any] = [
+            "project": info.projectName,
+            "songCount": songLengthsJson.count,
+            "songLengths": songLengthsJson,
+        ]
+
+        guard let jsonData = try? JSONSerialization.data(
+            withJSONObject: result,
+            options: [.prettyPrinted, .sortedKeys]
+        ), let json = String(data: jsonData, encoding: .utf8) else {
+            return CallTool.Result(content: [.text("song_lengths: JSON encoding failed")], isError: true)
+        }
+
+        return CallTool.Result(content: [.text(json)], isError: false)
     }
 
     // MARK: - analyze

@@ -39,6 +39,9 @@ struct ProjectDataInfo: Sendable, Codable {
     /// Full sub-track hierarchy grouped by function group / environment label.
     /// Each entry is a top-level stack with its channel strip children.
     var subTrackHierarchy: [SubTrackStack] = []
+
+    /// Per-song lengths derived from the reference track regions (or marker boundaries as fallback).
+    var songLengths: [SongLength] = []
 }
 
 // MARK: - Channel Strip
@@ -192,4 +195,22 @@ struct ParsedAudioFile: Sendable, Codable {
     var path: String
     /// Object identifier from the AuFl chunk header.
     var oid: Int
+}
+
+// MARK: - Song Lengths
+
+/// Per-song length record derived from reference track regions or marker boundaries.
+struct SongLength: Sendable, Codable {
+    /// Song / arrangement marker name (e.g. "Dead and Buried").
+    var songName: String
+    /// Start bar (1-based, inclusive).
+    var startBar: Int
+    /// End bar (1-based, exclusive — first bar of the next song).
+    var endBar: Int
+    /// Length in whole bars (endBar - startBar).
+    var lengthBars: Int
+    /// How this length was determined:
+    ///   "reference_region"  — taken from a matching reference track region
+    ///   "marker_boundary"   — marker-to-next-marker fallback
+    var source: String
 }
