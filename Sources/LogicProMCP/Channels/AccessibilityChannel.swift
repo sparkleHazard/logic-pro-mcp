@@ -46,6 +46,8 @@ actor AccessibilityChannel: Channel {
             return setTempo(params: params)
         case "transport.set_cycle_range":
             return setCycleRange(params: params)
+        case "transport.set_cycle_range_by_selection":
+            return setCycleRangeBySelection()
 
         // MARK: - Track reads
         case "track.get_tracks":
@@ -55,10 +57,22 @@ actor AccessibilityChannel: Channel {
 
         // MARK: - Track mutations
         case "track.select":
+            // Prefer name-based menu selection when 'name' param is provided
+            if let name = params["name"] {
+                return selectTrackByNameMenu(name: name)
+            }
             return selectTrack(params: params)
         case "track.set_mute":
+            // Prefer name-based when 'name' is provided
+            if let name = params["name"] {
+                return toggleTrackByNameMenu(name: name, key: 46, keyLabel: "Mute")
+            }
             return setTrackToggle(params: params, button: "Mute")
         case "track.set_solo":
+            // Prefer name-based when 'name' is provided
+            if let name = params["name"] {
+                return toggleTrackByNameMenu(name: name, key: 1, keyLabel: "Solo")
+            }
             return setTrackToggle(params: params, button: "Solo")
         case "track.set_arm":
             return setTrackToggle(params: params, button: "Record")
@@ -66,6 +80,18 @@ actor AccessibilityChannel: Channel {
             return renameTrack(params: params)
         case "track.set_color":
             return .error("Track color setting not supported via AX")
+
+        // MARK: - AX Menu operations
+        case "menu.click":
+            guard let pathStr = params["path"] else {
+                return .error("menu.click requires 'path' param (comma-separated menu titles)")
+            }
+            let components = pathStr.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard !components.isEmpty else {
+                return .error("menu.click: path must not be empty")
+            }
+            let ok = AXLogicProElements.clickMenuItem(path: components)
+            return ok ? .success("{\"clicked\":\"\(pathStr)\"}") : .error("Failed to click menu: \(pathStr)")
 
         // MARK: - Mixer reads
         case "mixer.get_state":
@@ -333,6 +359,116 @@ actor AccessibilityChannel: Channel {
             "To set the cycle range manually: enable Cycle (C), then drag the cycle region in the ruler, " +
             "or use Logic's Set Locators dialog (Option+click on cycle region)."
         )
+    }
+
+    /// Set the cycle range using Navigate > "Set Locators by Selection and Enable Cycle".
+    /// Requires that a region or marker is already selected in the arrange window.
+    private func setCycleRangeBySelection() -> ChannelResult {
+        let ok = AXLogicProElements.clickMenuItem(path: ["Navigate", "Set Locators by Selection and Enable Cycle"])
+        if ok {
+            return .success("{\"cycle_range_set\":\"by_selection\",\"via\":\"AX_menu\"}")
+        }
+        return .error("Failed to click Navigate > Set Locators by Selection and Enable Cycle")
+    }
+
+    // MARK: - AX Menu — Track Selection
+
+    /// Select a track by name using the Track > "Search and Select Track…" menu dialog.
+    ///
+    /// Steps:
+    ///   1. Open Track > "Search and Select Track…" via AX menu click.
+    ///   2. Wait 300 ms for the dialog to appear.
+    ///   3. Type the track name via CGEvent to the Logic Pro PID.
+    ///   4. Wait 200 ms for the search to filter.
+    ///   5. Press Return to confirm selection.
+    ///
+    /// Returns true on success.
+    static func selectTrackByNameViaMenu(_ name: String) -> Bool {
+        guard let pid = ProcessUtils.logicProPID() else {
+            Log.warn("selectTrackByNameViaMenu: Logic Pro not running", subsystem: "ax")
+            return false
+        }
+
+        // Open the search dialog — try Unicode ellipsis first, then ASCII "..."
+        let opened = AXLogicProElements.clickMenuItem(path: ["Track", "Search and Select Track\u{2026}"])
+            || AXLogicProElements.clickMenuItem(path: ["Track", "Search and Select Track..."])
+        guard opened else {
+            Log.warn("selectTrackByNameViaMenu: could not open Search and Select Track dialog", subsystem: "ax")
+            return false
+        }
+
+        // Wait for the dialog to appear
+        Thread.sleep(forTimeInterval: 0.3)
+
+        // Type the track name using CGEvent
+        guard let source = CGEventSource(stateID: .hidSystemState) else { return false }
+
+        // First clear any existing text with Cmd+A then type the name
+        if let selAll = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+           let selAllUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+            selAll.flags = .maskCommand
+            selAllUp.flags = .maskCommand
+            selAll.postToPid(pid)
+            selAllUp.postToPid(pid)
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        // Type each character of the track name
+        for scalar in name.unicodeScalars {
+            let char = scalar.value
+            // Use CGEventKeyboardSetUnicodeString for arbitrary characters
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) else { continue }
+            var utf16 = [UniChar(char & 0xFFFF)]
+            keyDown.keyboardSetUnicodeString(stringLength: 1, unicodeString: &utf16)
+            keyUp.keyboardSetUnicodeString(stringLength: 1, unicodeString: &utf16)
+            keyDown.postToPid(pid)
+            keyUp.postToPid(pid)
+        }
+
+        Thread.sleep(forTimeInterval: 0.2)
+
+        // Press Return to confirm
+        guard let returnDown = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: true),
+              let returnUp = CGEvent(keyboardEventSource: source, virtualKey: 36, keyDown: false) else { return false }
+        returnDown.postToPid(pid)
+        returnUp.postToPid(pid)
+
+        Thread.sleep(forTimeInterval: 0.1)
+        return true
+    }
+
+    private func selectTrackByNameMenu(name: String) -> ChannelResult {
+        let ok = AccessibilityChannel.selectTrackByNameViaMenu(name)
+        if ok {
+            return .success("{\"selected\":\"\(name)\",\"via\":\"AX_menu_search\"}")
+        }
+        return .error("Failed to select track '\(name)' via menu search")
+    }
+
+    /// Select a track by name then toggle mute/solo/arm via CGEvent key press.
+    private func toggleTrackByNameMenu(name: String, key: CGKeyCode, keyLabel: String) -> ChannelResult {
+        guard let pid = ProcessUtils.logicProPID() else {
+            return .error("Logic Pro is not running")
+        }
+
+        let selected = AccessibilityChannel.selectTrackByNameViaMenu(name)
+        guard selected else {
+            return .error("Cannot select track '\(name)' — track search failed")
+        }
+
+        // Brief pause so Logic registers the track selection before toggle
+        Thread.sleep(forTimeInterval: 0.1)
+
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let keyDown = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false) else {
+            return .error("Failed to create CGEvent for \(keyLabel) key")
+        }
+        keyDown.postToPid(pid)
+        keyUp.postToPid(pid)
+
+        return .success("{\"track\":\"\(name)\",\"toggled\":\"\(keyLabel)\",\"via\":\"AX_menu_search\"}")
     }
 
     // MARK: - Tracks

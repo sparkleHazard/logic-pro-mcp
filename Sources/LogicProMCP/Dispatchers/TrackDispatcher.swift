@@ -48,14 +48,23 @@ struct TrackDispatcher {
                 return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
             }
             if let name = params["name"]?.stringValue {
-                // Find track by name in cache
+                // Prefer AX menu-based name search (Track > Search and Select Track)
+                // Pass name directly to the channel which will use menu search
+                let result = await router.route(
+                    operation: "track.select",
+                    params: ["name": name]
+                )
+                if result.isSuccess {
+                    return CallTool.Result(content: [.text(result.message)], isError: false)
+                }
+                // Fallback: find track by name in cache and select by index
                 let tracks = await cache.getTracks()
                 if let track = tracks.first(where: { $0.name.localizedCaseInsensitiveContains(name) }) {
-                    let result = await router.route(
+                    let indexResult = await router.route(
                         operation: "track.select",
                         params: ["index": String(track.id)]
                     )
-                    return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
+                    return CallTool.Result(content: [.text(indexResult.message)], isError: !indexResult.isSuccess)
                 }
                 return CallTool.Result(content: [.text("No track found matching '\(name)'")], isError: true)
             }
@@ -113,8 +122,15 @@ struct TrackDispatcher {
             return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
 
         case "mute":
-            let index = params["index"]?.intValue ?? 0
             let enabled = params["enabled"]?.boolValue ?? true
+            if let name = params["name"]?.stringValue {
+                let result = await router.route(
+                    operation: "track.set_mute",
+                    params: ["name": name, "muted": String(enabled)]
+                )
+                return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
+            }
+            let index = params["index"]?.intValue ?? 0
             let result = await router.route(
                 operation: "track.set_mute",
                 params: ["index": String(index), "muted": String(enabled)]
@@ -122,8 +138,15 @@ struct TrackDispatcher {
             return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
 
         case "solo":
-            let index = params["index"]?.intValue ?? 0
             let enabled = params["enabled"]?.boolValue ?? true
+            if let name = params["name"]?.stringValue {
+                let result = await router.route(
+                    operation: "track.set_solo",
+                    params: ["name": name, "soloed": String(enabled)]
+                )
+                return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
+            }
+            let index = params["index"]?.intValue ?? 0
             let result = await router.route(
                 operation: "track.set_solo",
                 params: ["index": String(index), "soloed": String(enabled)]

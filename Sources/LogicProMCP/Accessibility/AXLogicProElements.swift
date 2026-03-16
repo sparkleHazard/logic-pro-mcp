@@ -148,6 +148,105 @@ enum AXLogicProElements {
         return current
     }
 
+    /// Click a menu item by navigating the full path, opening each level in sequence.
+    ///
+    /// Example: `clickMenuItem(path: ["Navigate", "Set Locators by Selection and Enable Cycle"])`
+    ///
+    /// The menu bar must be accessed from the app root. Each path segment:
+    ///   1. Finds the matching child element.
+    ///   2. Presses it (AXPress) to open the submenu.
+    ///   3. Pauses briefly to allow the menu to render.
+    ///   4. Moves into the opened menu before looking for the next title.
+    ///
+    /// Returns true if the final item was successfully pressed.
+    @discardableResult
+    static func clickMenuItem(path: [String]) -> Bool {
+        guard !path.isEmpty else { return false }
+        guard let menuBar = getMenuBar() else {
+            Log.warn("clickMenuItem: could not access menu bar", subsystem: "ax")
+            return false
+        }
+
+        // Step 1: Find and open the top-level menu bar item (e.g. "Navigate")
+        let topTitle = path[0]
+        let barItems = AXHelpers.getChildren(menuBar)
+        guard let barItem = barItems.first(where: { AXHelpers.getTitle($0) == topTitle }) else {
+            Log.warn("clickMenuItem: top-level menu '\(topTitle)' not found", subsystem: "ax")
+            return false
+        }
+
+        // Press the menu bar item to open the pull-down menu
+        guard AXHelpers.performAction(barItem, kAXPressAction) else {
+            Log.warn("clickMenuItem: failed to open menu '\(topTitle)'", subsystem: "ax")
+            return false
+        }
+        Thread.sleep(forTimeInterval: 0.15)
+
+        // Step 2: Navigate remaining path segments through opened menus
+        // After pressing a menu bar item, AX exposes the menu via kAXMenuAttribute or as a child.
+        var currentMenu: AXUIElement = barItem
+        let remainingPath = Array(path.dropFirst())
+
+        for (segIdx, segTitle) in remainingPath.enumerated() {
+            // Resolve the open menu: try kAXMenuAttribute first, then children
+            let openMenu: AXUIElement
+            if let menu: AXUIElement = AXHelpers.getAttribute(currentMenu, "AXMenu") {
+                openMenu = menu
+            } else {
+                // The bar item's children include the menu element
+                let kids = AXHelpers.getChildren(currentMenu)
+                guard let m = kids.first(where: { AXHelpers.getRole($0) == kAXMenuRole }) else {
+                    // Try pressing — current may already be an open menu
+                    openMenu = currentMenu
+                    _ = openMenu  // suppress warning
+                    // Fall through and search children directly
+                    let menuItems = AXHelpers.getChildren(currentMenu)
+                    guard let item = menuItemMatching(segTitle, in: menuItems) else {
+                        Log.warn("clickMenuItem: item '\(segTitle)' not found in menu", subsystem: "ax")
+                        return false
+                    }
+                    let isLast = segIdx == remainingPath.count - 1
+                    guard AXHelpers.performAction(item, kAXPressAction) else {
+                        Log.warn("clickMenuItem: failed to press '\(segTitle)'", subsystem: "ax")
+                        return false
+                    }
+                    if !isLast { Thread.sleep(forTimeInterval: 0.15) }
+                    currentMenu = item
+                    continue
+                }
+                openMenu = m
+            }
+
+            let menuItems = AXHelpers.getChildren(openMenu)
+            guard let item = menuItemMatching(segTitle, in: menuItems) else {
+                Log.warn("clickMenuItem: item '\(segTitle)' not found under '\(path[segIdx])'", subsystem: "ax")
+                return false
+            }
+
+            let isLast = segIdx == remainingPath.count - 1
+            guard AXHelpers.performAction(item, kAXPressAction) else {
+                Log.warn("clickMenuItem: failed to press '\(segTitle)'", subsystem: "ax")
+                return false
+            }
+            if !isLast { Thread.sleep(forTimeInterval: 0.15) }
+            currentMenu = item
+        }
+
+        return true
+    }
+
+    /// Find a menu item within a list of AX elements whose title matches (exact, then prefix).
+    private static func menuItemMatching(_ title: String, in items: [AXUIElement]) -> AXUIElement? {
+        // Exact match first
+        if let exact = items.first(where: { AXHelpers.getTitle($0) == title }) {
+            return exact
+        }
+        // Case-insensitive contains fallback
+        return items.first(where: {
+            AXHelpers.getTitle($0)?.localizedCaseInsensitiveContains(title) == true
+        })
+    }
+
     // MARK: - Arrangement
 
     /// Find the main arrangement area (the timeline/tracks view).

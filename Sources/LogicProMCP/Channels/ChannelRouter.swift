@@ -25,6 +25,7 @@ actor ChannelRouter {
         "transport.get_state":        [.accessibility],
         "transport.goto_position":    [.coreMIDI, .cgEvent],
         "transport.set_cycle_range":  [.accessibility, .appleScript],
+        "transport.set_cycle_range_by_selection": [.accessibility],
 
         // Track state reading
         "track.get_tracks":           [.accessibility],
@@ -141,6 +142,9 @@ actor ChannelRouter {
         "automation.set_mode":        [.accessibility, .cgEvent],
         "automation.toggle_view":     [.cgEvent, .accessibility],
         "automation.get_parameter":   [.accessibility],
+
+        // AX Menu operations — direct menu navigation
+        "menu.click":                 [.accessibility],
 
         // System — no channel needed
         "system.health":              [],

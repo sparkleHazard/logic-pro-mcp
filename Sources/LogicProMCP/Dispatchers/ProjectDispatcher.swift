@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import MCP
 
@@ -502,7 +503,7 @@ struct ProjectDispatcher {
         // --- Execute: for each group, solo those tracks → set cycle → bounce → unsolo ---
         var log: [String] = ["bounce_stems executing for bars \(startBar)–\(endBar):"]
 
-        // Set cycle range first
+        // Set cycle range first using bar positions
         let cycleResult = await router.route(
             operation: "transport.set_cycle_range",
             params: ["start": "\(startBar).1.1.1", "end": "\(endBar).1.1.1"]
@@ -514,41 +515,81 @@ struct ProjectDispatcher {
         }
         _ = await router.route(operation: "transport.toggle_cycle")
 
+        // Determine if we have a pid for CGEvent-based solo toggling
+        let hasPid = ProcessUtils.logicProPID() != nil
+
         for group in groups {
             guard let groupName = group["name"] as? String else { continue }
-            let names = group["stripNames"] as? [String] ?? []
-            log.append("  Group '\(groupName)': \(names.joined(separator: ", "))")
+            let stripNames = group["stripNames"] as? [String] ?? []
+            log.append("  Group '\(groupName)': \(stripNames.joined(separator: ", "))")
 
-            // Prefer AX track indices from the live track index map
+            var soloedNames: [String] = []
             var soloedIndices: [Int] = []
-            let groupAxIndices = group["trackIndices"] as? [Int] ?? []
 
-            if !groupAxIndices.isEmpty {
-                // Solo by AX index
-                for axIdx in groupAxIndices {
-                    let soloResult = await router.route(
-                        operation: "track.set_solo",
-                        params: ["index": "\(axIdx)", "enabled": "true"]
-                    )
-                    if soloResult.isSuccess {
-                        soloedIndices.append(axIdx)
+            if hasPid && !stripNames.isEmpty {
+                // Prefer name-based selection via Track > Search and Select Track menu
+                for stripName in stripNames {
+                    let selected = AccessibilityChannel.selectTrackByNameViaMenu(stripName)
+                    if selected {
+                        // Post S key via CGEvent to toggle solo on the now-selected track
+                        if let pid = ProcessUtils.logicProPID(),
+                           let source = CGEventSource(stateID: .hidSystemState),
+                           let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: true),
+                           let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: false) {
+                            keyDown.postToPid(pid)
+                            keyUp.postToPid(pid)
+                            soloedNames.append(stripName)
+                            log.append("    Soloed '\(stripName)' via menu search + S key")
+                        } else {
+                            log.append("    WARNING: selected '\(stripName)' but S-key post failed")
+                        }
                     } else {
-                        log.append("    WARNING: solo AX track \(axIdx) failed: \(soloResult.message)")
+                        log.append("    WARNING: could not select '\(stripName)' via menu search; trying AX index fallback")
+                        // Fallback to AX index if available
+                        if let strips = group["strips"] as? [[String: Any]],
+                           let stripNode = strips.first(where: { $0["name"] as? String == stripName }),
+                           let axIdx = stripNode["trackIndex"] as? Int {
+                            let soloResult = await router.route(
+                                operation: "track.set_solo",
+                                params: ["index": "\(axIdx)", "enabled": "true"]
+                            )
+                            if soloResult.isSuccess {
+                                soloedIndices.append(axIdx)
+                            } else {
+                                log.append("    WARNING: AX index solo also failed for '\(stripName)': \(soloResult.message)")
+                            }
+                        }
                     }
                 }
             } else {
-                // Fallback: solo by MSeq position in info.tracks
-                let oids = group["stripOids"] as? [Int] ?? []
-                let mseqOids = (group["mseqOids"] as? [Int]) ?? oids
-                for (trackIdx, track) in info.tracks.enumerated() where mseqOids.contains(track.oid) {
-                    let soloResult = await router.route(
-                        operation: "track.set_solo",
-                        params: ["index": "\(trackIdx)", "enabled": "true"]
-                    )
-                    if soloResult.isSuccess {
-                        soloedIndices.append(trackIdx)
-                    } else {
-                        log.append("    WARNING: solo track \(trackIdx) (\(track.name)) failed: \(soloResult.message)")
+                // No PID or no strip names — fall back to AX index approach
+                let groupAxIndices = group["trackIndices"] as? [Int] ?? []
+                if !groupAxIndices.isEmpty {
+                    for axIdx in groupAxIndices {
+                        let soloResult = await router.route(
+                            operation: "track.set_solo",
+                            params: ["index": "\(axIdx)", "enabled": "true"]
+                        )
+                        if soloResult.isSuccess {
+                            soloedIndices.append(axIdx)
+                        } else {
+                            log.append("    WARNING: solo AX track \(axIdx) failed: \(soloResult.message)")
+                        }
+                    }
+                } else {
+                    // Fallback: solo by MSeq position in info.tracks
+                    let oids = group["stripOids"] as? [Int] ?? []
+                    let mseqOids = (group["mseqOids"] as? [Int]) ?? oids
+                    for (trackIdx, track) in info.tracks.enumerated() where mseqOids.contains(track.oid) {
+                        let soloResult = await router.route(
+                            operation: "track.set_solo",
+                            params: ["index": "\(trackIdx)", "enabled": "true"]
+                        )
+                        if soloResult.isSuccess {
+                            soloedIndices.append(trackIdx)
+                        } else {
+                            log.append("    WARNING: solo track \(trackIdx) (\(track.name)) failed: \(soloResult.message)")
+                        }
                     }
                 }
             }
@@ -557,7 +598,19 @@ struct ProjectDispatcher {
             let bounceResult = await router.route(operation: "project.bounce_section")
             log.append("    Bounce dialog: \(bounceResult.message)")
 
-            // Un-solo
+            // Un-solo by name (re-press S key on each selected track)
+            for stripName in soloedNames {
+                let reselected = AccessibilityChannel.selectTrackByNameViaMenu(stripName)
+                if reselected,
+                   let pid = ProcessUtils.logicProPID(),
+                   let source = CGEventSource(stateID: .hidSystemState),
+                   let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: true),
+                   let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 1, keyDown: false) {
+                    keyDown.postToPid(pid)
+                    keyUp.postToPid(pid)
+                }
+            }
+            // Un-solo by index (legacy fallback)
             for idx in soloedIndices {
                 _ = await router.route(
                     operation: "track.set_solo",
