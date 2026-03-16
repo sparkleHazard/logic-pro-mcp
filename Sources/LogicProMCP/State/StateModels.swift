@@ -38,6 +38,8 @@ struct TrackState: Sendable, Codable, Identifiable {
     var volume: Double = 0.0   // dB, 0 = unity
     var pan: Double = 0.0      // -1.0 (L) to 1.0 (R)
     var color: String?
+    /// Output routing label (e.g. "Stereo Out", "Bus 1"). Populated via AX inspection.
+    var outputRouting: String?
 }
 
 /// Mixer channel strip state (extends track with routing info).
@@ -83,7 +85,10 @@ struct RegionState: Sendable, Codable, Identifiable {
 struct MarkerState: Sendable, Codable, Identifiable {
     let id: Int
     var name: String
+    /// Bar position as a string (e.g. "1.1.1.1" or "Verse").
     var position: String
+    /// Bar number extracted from position, if available (1-based).
+    var bar: Int?
 }
 
 /// Automation mode.

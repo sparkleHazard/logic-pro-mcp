@@ -7,13 +7,14 @@ struct NavigateDispatcher {
         description: """
             Navigation and markers in Logic Pro. \
             Commands: goto_bar, goto_marker, create_marker, delete_marker, \
-            rename_marker, zoom_to_fit, set_zoom, toggle_view. \
+            rename_marker, list_markers, zoom_to_fit, set_zoom, toggle_view. \
             Params by command: \
             goto_bar -> { bar: Int }; \
             goto_marker -> { index: Int } or { name: String }; \
             create_marker -> { name: String } (at current playhead); \
             rename_marker -> { index: Int, name: String }; \
             delete_marker -> { index: Int }; \
+            list_markers -> {} (returns all markers with name and bar position); \
             set_zoom -> { level: String } ("in", "out", "fit"); \
             toggle_view -> { view: String } ("mixer", "piano_roll", "score", \
             "step_editor", "library", "inspector", "automation")
@@ -38,7 +39,8 @@ struct NavigateDispatcher {
         command: String,
         params: [String: Value],
         router: ChannelRouter,
-        cache: StateCache
+        cache: StateCache,
+        axChannel: AccessibilityChannel? = nil
     ) async -> CallTool.Result {
         switch command {
         case "goto_bar":
@@ -58,7 +60,14 @@ struct NavigateDispatcher {
                 return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
             }
             if let name = params["name"]?.stringValue {
-                let markers = await cache.getMarkers()
+                // Prefer a fresh AX read so name-based lookup works in one-shot mode.
+                let markers: [MarkerState]
+                if let ax = axChannel, let live = await ax.readMarkersDirect() {
+                    await cache.updateMarkers(live)
+                    markers = live
+                } else {
+                    markers = await cache.getMarkers()
+                }
                 if let marker = markers.first(where: { $0.name.localizedCaseInsensitiveContains(name) }) {
                     let result = await router.route(
                         operation: "nav.goto_marker",
@@ -66,9 +75,35 @@ struct NavigateDispatcher {
                     )
                     return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
                 }
-                return CallTool.Result(content: [.text("No marker found matching '\(name)'")], isError: true)
+                return CallTool.Result(
+                    content: [.text("No marker found matching '\(name)'. Use list_markers to see available markers.")],
+                    isError: true
+                )
             }
             return CallTool.Result(content: [.text("goto_marker requires 'index' or 'name' param")], isError: true)
+
+        case "list_markers":
+            // Direct AX read for freshness, fall back to cache.
+            let markers: [MarkerState]
+            if let ax = axChannel, let live = await ax.readMarkersDirect() {
+                await cache.updateMarkers(live)
+                markers = live
+            } else {
+                markers = await cache.getMarkers()
+            }
+            if markers.isEmpty {
+                return CallTool.Result(
+                    content: [.text("{\"markers\":[],\"note\":\"No markers found — is a project with markers open?\"}")],
+                    isError: false
+                )
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            if let data = try? encoder.encode(markers),
+               let json = String(data: data, encoding: .utf8) {
+                return CallTool.Result(content: [.text(json)], isError: false)
+            }
+            return CallTool.Result(content: [.text("Failed to encode markers")], isError: true)
 
         case "create_marker":
             let name = params["name"]?.stringValue ?? "Marker"
@@ -148,7 +183,7 @@ struct NavigateDispatcher {
 
         default:
             return CallTool.Result(
-                content: [.text("Unknown navigate command: \(command). Available: goto_bar, goto_marker, create_marker, delete_marker, rename_marker, zoom_to_fit, set_zoom, toggle_view")],
+                content: [.text("Unknown navigate command: \(command). Available: goto_bar, goto_marker, create_marker, delete_marker, rename_marker, list_markers, zoom_to_fit, set_zoom, toggle_view")],
                 isError: true
             )
         }

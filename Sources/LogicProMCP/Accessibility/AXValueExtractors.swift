@@ -84,7 +84,7 @@ enum AXValueExtractors {
         return SliderRange(min: min, max: max)
     }
 
-    /// Read a track header and extract its basic state.
+    /// Read a track header and extract its full state including type, mute/solo/arm, and output routing.
     static func extractTrackState(from header: AXUIElement, index: Int) -> TrackState {
         let name = extractTrackName(from: header)
         let muted = extractTrackButtonState(from: header, prefix: "Mute") ?? false
@@ -92,6 +92,7 @@ enum AXValueExtractors {
         let armed = extractTrackButtonState(from: header, prefix: "Record") ?? false
         let selected = extractSelectedState(header) ?? false
         let trackType = inferTrackType(from: header)
+        let output = extractOutputRouting(from: header)
 
         return TrackState(
             id: index,
@@ -103,7 +104,8 @@ enum AXValueExtractors {
             isSelected: selected,
             volume: 0.0,
             pan: 0.0,
-            color: extractTrackColor(from: header)
+            color: extractTrackColor(from: header),
+            outputRouting: output
         )
     }
 
@@ -155,6 +157,103 @@ enum AXValueExtractors {
         return state
     }
 
+    // MARK: - Marker extraction
+
+    /// Extract arrangement markers from the Logic Pro AX tree.
+    ///
+    /// Logic Pro exposes markers in several locations depending on version:
+    ///   1. A dedicated "Marker Track" / "Marker List" in the arrangement
+    ///   2. Within the arrangement ruler area
+    ///   3. Via a pop-up marker list accessible from the marker track header
+    ///
+    /// This method attempts each strategy in order and returns whatever it finds.
+    static func extractMarkers() -> [MarkerState] {
+        var markers: [MarkerState] = []
+
+        guard let window = AXLogicProElements.mainWindow() else { return markers }
+
+        // Strategy 1: Look for elements with "marker" in identifier or description
+        let markerCandidates = findMarkerElements(in: window)
+        if !markerCandidates.isEmpty {
+            for (index, element) in markerCandidates.enumerated() {
+                if let marker = markerFromElement(element, index: index) {
+                    markers.append(marker)
+                }
+            }
+            if !markers.isEmpty { return markers }
+        }
+
+        // Strategy 2: Scan the arrangement area for marker-like rows
+        if let arrangement = AXLogicProElements.getArrangementArea() {
+            let rows = AXHelpers.findAllDescendants(of: arrangement, role: kAXRowRole, maxDepth: 4)
+            for (index, row) in rows.enumerated() {
+                let desc = AXHelpers.getDescription(row)?.lowercased() ?? ""
+                let title = AXHelpers.getTitle(row)?.lowercased() ?? ""
+                if desc.contains("marker") || title.contains("marker") {
+                    if let marker = markerFromElement(row, index: index) {
+                        markers.append(marker)
+                    }
+                }
+            }
+        }
+
+        return markers
+    }
+
+    private static func findMarkerElements(in root: AXUIElement) -> [AXUIElement] {
+        var results: [AXUIElement] = []
+        // Search for groups or rows whose description contains "marker"
+        let groups = AXHelpers.findAllDescendants(of: root, role: kAXGroupRole, maxDepth: 8)
+        for group in groups {
+            let desc = AXHelpers.getDescription(group)?.lowercased() ?? ""
+            let id = AXHelpers.getIdentifier(group)?.lowercased() ?? ""
+            if desc.contains("marker") || id.contains("marker") {
+                let children = AXHelpers.getChildren(group)
+                if children.isEmpty {
+                    results.append(group)
+                } else {
+                    results.append(contentsOf: children)
+                }
+            }
+        }
+        return results
+    }
+
+    private static func markerFromElement(_ element: AXUIElement, index: Int) -> MarkerState? {
+        // Try to get the marker name and position
+        let name = AXHelpers.getTitle(element)
+            ?? AXHelpers.getDescription(element)
+            ?? extractTextValue(element)
+            ?? "Marker \(index + 1)"
+
+        // Skip empty or obviously non-marker elements
+        let nameLower = name.lowercased()
+        if nameLower.isEmpty || nameLower == "marker track" { return nil }
+
+        // Try to find a position value in child text elements
+        var positionStr = "1.1.1.1"
+        var barNumber: Int? = nil
+        let texts = AXHelpers.findAllDescendants(of: element, role: kAXStaticTextRole, maxDepth: 3)
+        for text in texts {
+            if let val = extractTextValue(text) {
+                // Bar.Beat.Division.Tick format: digits separated by dots
+                if val.filter({ $0 == "." }).count >= 2, let firstComponent = val.components(separatedBy: ".").first, let bar = Int(firstComponent) {
+                    positionStr = val
+                    barNumber = bar
+                    break
+                }
+                // Pure bar number
+                if let bar = Int(val.trimmingCharacters(in: .whitespaces)) {
+                    positionStr = "\(bar).1.1.1"
+                    barNumber = bar
+                    break
+                }
+            }
+        }
+
+        return MarkerState(id: index, name: name, position: positionStr, bar: barNumber)
+    }
+
     // MARK: - Private helpers
 
     private static func extractTrackName(from header: AXUIElement) -> String {
@@ -186,7 +285,11 @@ enum AXValueExtractors {
         // Attempt to infer type from icon description or element identifiers
         let desc = AXHelpers.getDescription(header)?.lowercased() ?? ""
         let title = AXHelpers.getTitle(header)?.lowercased() ?? ""
-        let combined = desc + " " + title
+        // Also check child elements for type indicators (e.g. instrument icon labels)
+        let childDescriptions = AXHelpers.getChildren(header).compactMap {
+            AXHelpers.getDescription($0)?.lowercased()
+        }.joined(separator: " ")
+        let combined = desc + " " + title + " " + childDescriptions
 
         if combined.contains("audio") { return .audio }
         if combined.contains("instrument") || combined.contains("software") { return .softwareInstrument }
@@ -196,6 +299,32 @@ enum AXValueExtractors {
         if combined.contains("bus") { return .bus }
         if combined.contains("master") || combined.contains("stereo out") { return .master }
         return .unknown
+    }
+
+    /// Extract output routing label from a track header.
+    /// Logic Pro may expose the output assignment as a popup button or static text
+    /// labeled "Output", "Stereo Out", "Bus N", etc.
+    private static func extractOutputRouting(from header: AXUIElement) -> String? {
+        // Look for popup buttons (output selectors are typically AXPopUpButton)
+        let popups = AXHelpers.findAllDescendants(of: header, role: kAXPopUpButtonRole, maxDepth: 4)
+        for popup in popups {
+            let desc = AXHelpers.getDescription(popup)?.lowercased() ?? ""
+            let title = AXHelpers.getTitle(popup) ?? ""
+            if desc.contains("output") || desc.contains("out") {
+                return title.isEmpty ? nil : title
+            }
+        }
+        // Fallback: static text that looks like an output label
+        let statics = AXHelpers.findAllDescendants(of: header, role: kAXStaticTextRole, maxDepth: 4)
+        for text in statics {
+            if let val = extractTextValue(text) {
+                let lower = val.lowercased()
+                if lower.contains("stereo out") || lower.contains("bus ") || lower.contains("output") {
+                    return val
+                }
+            }
+        }
+        return nil
     }
 
     private static func extractTrackColor(from header: AXUIElement) -> String? {

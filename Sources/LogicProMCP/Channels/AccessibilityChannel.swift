@@ -40,6 +40,8 @@ actor AccessibilityChannel: Channel {
             return toggleTransportButton(named: "Cycle")
         case "transport.toggle_metronome":
             return toggleTransportButton(named: "Metronome")
+        case "transport.toggle_count_in":
+            return toggleTransportButton(named: "Count In")
         case "transport.set_tempo":
             return setTempo(params: params)
         case "transport.set_cycle_range":
@@ -87,7 +89,7 @@ actor AccessibilityChannel: Channel {
 
         // MARK: - Navigation
         case "nav.get_markers":
-            return .error("Marker reading not yet implemented via AX")
+            return getMarkers()
         case "nav.rename_marker":
             return .error("Marker renaming not yet implemented via AX")
 
@@ -130,6 +132,71 @@ actor AccessibilityChannel: Channel {
         return .healthy(detail: "AX connected to Logic Pro")
     }
 
+    // MARK: - Direct synchronous AX reads (for ResourceHandlers one-shot queries)
+
+    /// Directly read transport state from AX (bypasses cache).
+    func readTransportStateDirect() -> TransportState? {
+        guard AXIsProcessTrusted(), ProcessUtils.isLogicProRunning else { return nil }
+        guard let transport = AXLogicProElements.getTransportBar() else { return nil }
+        return AXValueExtractors.extractTransportState(from: transport)
+    }
+
+    /// Directly read all tracks from AX (bypasses cache).
+    func readTracksDirect() -> [TrackState]? {
+        guard AXIsProcessTrusted(), ProcessUtils.isLogicProRunning else { return nil }
+        let headers = AXLogicProElements.allTrackHeaders()
+        guard !headers.isEmpty else { return nil }
+        return headers.enumerated().map { (index, header) in
+            AXValueExtractors.extractTrackState(from: header, index: index)
+        }
+    }
+
+    /// Directly read all channel strips from AX (bypasses cache).
+    func readMixerDirect() -> [ChannelStripState]? {
+        guard AXIsProcessTrusted(), ProcessUtils.isLogicProRunning else { return nil }
+        guard let mixer = AXLogicProElements.getMixerArea() else { return nil }
+        let strips = AXHelpers.getChildren(mixer)
+        guard !strips.isEmpty else { return nil }
+        return strips.enumerated().map { (index, strip) in
+            let sliders = AXHelpers.findAllDescendants(of: strip, role: kAXSliderRole, maxDepth: 4)
+            let volume = sliders.first.flatMap { AXValueExtractors.extractSliderValue($0) } ?? 0.0
+            let pan = sliders.count > 1
+                ? AXValueExtractors.extractSliderValue(sliders[1]) ?? 0.0
+                : 0.0
+            return ChannelStripState(trackIndex: index, volume: volume, pan: pan)
+        }
+    }
+
+    /// Directly read project info from AX (bypasses cache).
+    func readProjectInfoDirect() -> ProjectInfo? {
+        guard AXIsProcessTrusted(), ProcessUtils.isLogicProRunning else { return nil }
+        guard let window = AXLogicProElements.mainWindow() else { return nil }
+        let rawTitle = AXHelpers.getTitle(window) ?? ""
+        var info = ProjectInfo()
+        // Window title is typically "<project name> - Logic Pro"
+        if let dashRange = rawTitle.range(of: " - Logic Pro") {
+            info.name = String(rawTitle[rawTitle.startIndex..<dashRange.lowerBound])
+        } else if rawTitle.contains("Logic Pro") {
+            info.name = "Untitled"
+        } else {
+            info.name = rawTitle.isEmpty ? "Untitled" : rawTitle
+        }
+        // Attempt to read tempo + time signature from transport bar
+        if let transport = AXLogicProElements.getTransportBar() {
+            let state = AXValueExtractors.extractTransportState(from: transport)
+            info.tempo = state.tempo
+            info.sampleRate = state.sampleRate
+        }
+        info.lastUpdated = Date()
+        return info
+    }
+
+    /// Directly read all arrangement markers from AX (bypasses cache).
+    func readMarkersDirect() -> [MarkerState]? {
+        guard AXIsProcessTrusted(), ProcessUtils.isLogicProRunning else { return nil }
+        return AXValueExtractors.extractMarkers()
+    }
+
     // MARK: - Transport
 
     private func getTransportState() -> ChannelResult {
@@ -151,7 +218,7 @@ actor AccessibilityChannel: Channel {
     }
 
     private func setTempo(params: [String: String]) -> ChannelResult {
-        guard let tempoStr = params["tempo"], let _ = Double(tempoStr) else {
+        guard let tempoStr = params["tempo"] ?? params["bpm"], let _ = Double(tempoStr) else {
             return .error("Missing or invalid 'tempo' parameter")
         }
         guard let transport = AXLogicProElements.getTransportBar() else {
@@ -323,9 +390,22 @@ actor AccessibilityChannel: Channel {
         return .success("{\"\(label)\":\(value),\"track\":\(index)}")
     }
 
+    // MARK: - Markers
+
+    private func getMarkers() -> ChannelResult {
+        let markers = AXValueExtractors.extractMarkers()
+        if markers.isEmpty {
+            return .error("No markers found — is a project with markers open?")
+        }
+        return encodeResult(markers)
+    }
+
     // MARK: - Project
 
     private func getProjectInfo() -> ChannelResult {
+        if let info = readProjectInfoDirect() {
+            return encodeResult(info)
+        }
         guard let window = AXLogicProElements.mainWindow() else {
             return .error("Cannot locate Logic Pro main window")
         }

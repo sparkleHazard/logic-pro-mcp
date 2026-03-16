@@ -20,6 +20,7 @@ actor ChannelRouter {
         "transport.fast_forward":     [.cgEvent, .coreMIDI],
         "transport.toggle_cycle":     [.cgEvent, .accessibility],
         "transport.toggle_metronome": [.cgEvent, .accessibility],
+        "transport.toggle_count_in":  [.cgEvent, .accessibility],
         "transport.set_tempo":        [.osc, .accessibility],
         "transport.get_state":        [.accessibility],
         "transport.goto_position":    [.coreMIDI, .cgEvent],
@@ -84,6 +85,7 @@ actor ChannelRouter {
         "nav.delete_marker":          [.cgEvent, .accessibility],
         "nav.rename_marker":          [.accessibility],
         "nav.get_markers":            [.accessibility],
+        "nav.list_markers":           [.accessibility],
         "nav.zoom_to_fit":            [.cgEvent],
         "nav.set_zoom_level":         [.cgEvent],
 
@@ -109,6 +111,7 @@ actor ChannelRouter {
         "project.close":              [.cgEvent, .appleScript],
         "project.get_info":           [.accessibility],
         "project.bounce":             [.cgEvent, .accessibility],
+        "project.bounce_section":     [.cgEvent, .accessibility],
         "project.is_running":         [],  // No channel needed — pure process check
 
         // Views — keyboard toggle
@@ -171,6 +174,17 @@ actor ChannelRouter {
 
     // MARK: - Routing
 
+    /// Operations that route through CoreMIDI/MMC where silent failure is possible.
+    /// When these succeed via CoreMIDI, a warning note is appended to the result.
+    private static let mmcOperations: Set<String> = [
+        "transport.play", "transport.stop", "transport.record", "transport.pause",
+        "transport.rewind", "transport.fast_forward", "transport.goto_position",
+        "mmc.play", "mmc.stop", "mmc.record_strobe", "mmc.record_exit",
+        "mmc.locate", "mmc.pause",
+    ]
+
+    private static let mmcWarning = " (Note: sent via CoreMIDI/MMC — if Logic Pro is not configured to receive MMC, this may not have had effect. Enable in Logic Pro > Preferences > MIDI > Sync > MMC Input)"
+
     /// Route an operation through its fallback chain.
     /// Returns the result from the first channel that succeeds.
     func route(operation: String, params: [String: String] = [:]) async -> ChannelResult {
@@ -200,8 +214,12 @@ actor ChannelRouter {
 
             let result = await channel.execute(operation: operation, params: params)
             switch result {
-            case .success:
+            case .success(let msg):
                 Log.debug("\(operation) succeeded via \(channelID.rawValue)", subsystem: "router")
+                // Append MMC warning when the successful channel is CoreMIDI for transport ops
+                if channelID == .coreMIDI && Self.mmcOperations.contains(operation) {
+                    return .success(msg + Self.mmcWarning)
+                }
                 return result
             case .error(let msg):
                 Log.debug("\(operation) failed via \(channelID.rawValue): \(msg), trying next", subsystem: "router")

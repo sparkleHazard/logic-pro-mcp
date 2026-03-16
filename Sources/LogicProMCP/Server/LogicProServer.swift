@@ -66,6 +66,7 @@ actor LogicProServer {
         // Capture for closures
         let router = self.router
         let cache = self.cache
+        let axChannel = self.axChannel
 
         await server.withMethodHandler(CallTool.self) { params in
             let name = params.name
@@ -102,12 +103,14 @@ actor LogicProServer {
 
             case "logic_navigate":
                 return await NavigateDispatcher.handle(
-                    command: command, params: cmdParams, router: router, cache: cache
+                    command: command, params: cmdParams, router: router, cache: cache,
+                    axChannel: axChannel
                 )
 
             case "logic_project":
                 return await ProjectDispatcher.handle(
-                    command: command, params: cmdParams, router: router, cache: cache
+                    command: command, params: cmdParams, router: router, cache: cache,
+                    axChannel: axChannel
                 )
 
             case "logic_system":
@@ -124,11 +127,12 @@ actor LogicProServer {
         }
     }
 
-    // MARK: - Resource Registration (7 resources)
+    // MARK: - Resource Registration (8 resources)
 
     private func registerResources() async {
         let router = self.router
         let cache = self.cache
+        let axChannel = self.axChannel
 
         await server.withMethodHandler(ListResources.self) { _ in
             ListResources.Result(resources: ResourceProvider.resources, nextCursor: nil)
@@ -138,7 +142,8 @@ actor LogicProServer {
             try await ResourceHandlers.read(
                 uri: params.uri,
                 cache: cache,
-                router: router
+                router: router,
+                axChannel: axChannel
             )
         }
 
@@ -169,7 +174,7 @@ actor LogicProServer {
         await registerResources()
 
         Log.info(
-            "Starting \(ServerConfig.serverName) v\(ServerConfig.serverVersion) — 8 tools, 7 resources",
+            "Starting \(ServerConfig.serverName) v\(ServerConfig.serverVersion) — 8 tools, 8 resources",
             subsystem: "server"
         )
 

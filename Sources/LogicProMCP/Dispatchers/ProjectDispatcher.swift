@@ -6,11 +6,13 @@ struct ProjectDispatcher {
         name: "logic_project",
         description: """
             Project lifecycle in Logic Pro. \
-            Commands: new, open, save, save_as, close, bounce, launch, quit. \
+            Commands: new, open, save, save_as, close, bounce, bounce_section, launch, quit. \
             Params by command: \
             open -> { path: String }; \
             save_as -> { path: String }; \
             bounce -> {} (opens bounce dialog); \
+            bounce_section -> { marker_name: String } or { start_bar: Int, end_bar: Int } \
+            (sets cycle range to section boundaries, enables cycle, opens bounce dialog); \
             launch/quit -> {} (app lifecycle); \
             Others -> {}
             """,
@@ -34,7 +36,8 @@ struct ProjectDispatcher {
         command: String,
         params: [String: Value],
         router: ChannelRouter,
-        cache: StateCache
+        cache: StateCache,
+        axChannel: AccessibilityChannel? = nil
     ) async -> CallTool.Result {
         switch command {
         case "new":
@@ -75,6 +78,9 @@ struct ProjectDispatcher {
             let result = await router.route(operation: "project.bounce")
             return CallTool.Result(content: [.text(result.message)], isError: !result.isSuccess)
 
+        case "bounce_section":
+            return await bounceSection(params: params, router: router, cache: cache, axChannel: axChannel)
+
         case "launch":
             if ProcessUtils.isLogicProRunning {
                 return CallTool.Result(content: [.text("Logic Pro is already running")], isError: false)
@@ -109,9 +115,114 @@ struct ProjectDispatcher {
 
         default:
             return CallTool.Result(
-                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, launch, quit")],
+                content: [.text("Unknown project command: \(command). Available: new, open, save, save_as, close, bounce, bounce_section, launch, quit")],
                 isError: true
             )
         }
+    }
+
+    // MARK: - bounce_section
+
+    /// Set cycle range to the section boundaries, enable cycle mode, then open the bounce dialog.
+    ///
+    /// Accepts either:
+    ///   - `marker_name`: looks up a marker by name and uses its bar position
+    ///   - `start_bar` + `end_bar`: explicit bar range
+    private static func bounceSection(
+        params: [String: Value],
+        router: ChannelRouter,
+        cache: StateCache,
+        axChannel: AccessibilityChannel?
+    ) async -> CallTool.Result {
+        var startBar: Int
+        var endBar: Int
+
+        if let markerName = params["marker_name"]?.stringValue {
+            // Resolve marker boundaries: find this marker and the next one.
+            let markers: [MarkerState]
+            if let ax = axChannel, let live = await ax.readMarkersDirect() {
+                await cache.updateMarkers(live)
+                markers = live
+            } else {
+                markers = await cache.getMarkers()
+            }
+
+            guard let target = markers.first(where: { $0.name.localizedCaseInsensitiveContains(markerName) }) else {
+                return CallTool.Result(
+                    content: [.text("No marker found matching '\(markerName)'. Use list_markers to see available markers.")],
+                    isError: true
+                )
+            }
+
+            // Extract start bar from marker position
+            guard let targetBar = target.bar ?? barFromPositionString(target.position) else {
+                return CallTool.Result(
+                    content: [.text("Cannot determine bar position for marker '\(target.name)' (position: \(target.position))")],
+                    isError: true
+                )
+            }
+            startBar = targetBar
+
+            // End bar: look for the next marker with a higher bar number, or default to start + 8
+            let sortedMarkers = markers.compactMap { m -> (bar: Int, marker: MarkerState)? in
+                guard let b = m.bar ?? barFromPositionString(m.position) else { return nil }
+                return (bar: b, marker: m)
+            }.sorted { $0.bar < $1.bar }
+
+            if let nextEntry = sortedMarkers.first(where: { $0.bar > startBar }) {
+                endBar = nextEntry.bar
+            } else {
+                endBar = startBar + 8
+            }
+        } else if let sb = params["start_bar"]?.intValue, let eb = params["end_bar"]?.intValue {
+            startBar = sb
+            endBar = eb
+        } else {
+            return CallTool.Result(
+                content: [.text("bounce_section requires 'marker_name' or both 'start_bar' and 'end_bar'")],
+                isError: true
+            )
+        }
+
+        guard endBar > startBar else {
+            return CallTool.Result(
+                content: [.text("end_bar (\(endBar)) must be greater than start_bar (\(startBar))")],
+                isError: true
+            )
+        }
+
+        // Step 1: Set cycle range
+        let cycleResult = await router.route(
+            operation: "transport.set_cycle_range",
+            params: ["start": "\(startBar).1.1.1", "end": "\(endBar).1.1.1"]
+        )
+        if !cycleResult.isSuccess {
+            return CallTool.Result(
+                content: [.text("Failed to set cycle range [\(startBar)-\(endBar)]: \(cycleResult.message)")],
+                isError: true
+            )
+        }
+
+        // Step 2: Enable cycle mode
+        let toggleResult = await router.route(operation: "transport.toggle_cycle")
+        // Not fatal if this fails — cycle may already be enabled
+
+        // Step 3: Open bounce dialog (Cmd+B)
+        let bounceResult = await router.route(operation: "project.bounce_section")
+        let cycleNote = toggleResult.isSuccess ? "" : " (cycle toggle may have failed: \(toggleResult.message))"
+        let summary = "Cycle set to bars \(startBar)–\(endBar)\(cycleNote). Bounce dialog: \(bounceResult.message)"
+        return CallTool.Result(
+            content: [.text(summary)],
+            isError: !bounceResult.isSuccess
+        )
+    }
+
+    /// Parse a bar number from a "Bar.Beat.Division.Tick" or plain integer string.
+    private static func barFromPositionString(_ position: String) -> Int? {
+        let trimmed = position.trimmingCharacters(in: .whitespaces)
+        if let bar = Int(trimmed) { return bar }
+        let components = trimmed.components(separatedBy: ".")
+        if let first = components.first, let bar = Int(first) { return bar }
+        return nil
     }
 }

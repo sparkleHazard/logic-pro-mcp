@@ -45,6 +45,7 @@ actor CGEventChannel: Channel {
         "transport.fast_forward":     .key(124),        // Right arrow
         "transport.toggle_cycle":     .key(8),          // C
         "transport.toggle_metronome": .key(40),         // K
+        "transport.toggle_count_in":  .key(39),         // ' (apostrophe — Logic default for Count In)
         "transport.goto_position":    .key(47),         // / (opens Go To Position)
 
         // Editing
@@ -69,6 +70,8 @@ actor CGEventChannel: Channel {
         "project.save":               .cmd(1),          // Cmd+S
         "project.save_as":            .cmdShift(1),     // Cmd+Shift+S
         "project.close":              .cmd(13),         // Cmd+W
+        "project.bounce":             .cmd(11),         // Cmd+B
+        "project.bounce_section":     .cmd(11),         // Cmd+B (bounce dialog)
 
         // Track creation
         "track.create_audio":         .cmdOption(0),    // Option+Cmd+A (approximate)

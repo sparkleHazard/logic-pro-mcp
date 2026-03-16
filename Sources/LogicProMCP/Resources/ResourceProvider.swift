@@ -14,7 +14,7 @@ struct ResourceProvider {
         Resource(
             name: "Tracks",
             uri: "logic://tracks",
-            description: "All tracks: name, type, index, mute/solo/arm states",
+            description: "All tracks: name, type (audio/software_instrument/drummer/aux/bus/folder), index, mute/solo/arm states, output routing",
             mimeType: "application/json"
         ),
         Resource(
@@ -26,7 +26,13 @@ struct ResourceProvider {
         Resource(
             name: "Project Info",
             uri: "logic://project/info",
-            description: "Project name, sample rate, time signature, track count",
+            description: "Project name, tempo, time signature, sample rate, bit depth, track count. Read directly from Logic Pro via AX for freshness.",
+            mimeType: "application/json"
+        ),
+        Resource(
+            name: "Markers",
+            uri: "logic://markers",
+            description: "All arrangement markers: name, bar position (1-based), position string. Read via Accessibility API.",
             mimeType: "application/json"
         ),
         Resource(
@@ -47,7 +53,7 @@ struct ResourceProvider {
         Resource.Template(
             uriTemplate: "logic://tracks/{index}",
             name: "Track Detail",
-            description: "Single track detail by index (including automation mode)",
+            description: "Single track detail by index (including type, mute/solo/arm, output routing)",
             mimeType: "application/json"
         ),
     ]
